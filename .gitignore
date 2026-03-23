@@ -8,3 +8,5 @@
 **/data/deepseek_delta_cache.json
 **/data/deepseek_cooldown.json
 **/data/analysis_jobs/
+**/apps/fundamental/data/watchlist.json
+**/apps/fundamental/data/cache/
