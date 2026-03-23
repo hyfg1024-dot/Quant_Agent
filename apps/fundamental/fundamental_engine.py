@@ -13,7 +13,7 @@ import akshare as ak
 import pandas as pd
 
 
-APP_VERSION = "FND-20260323-01"
+APP_VERSION = "FND-20260323-02"
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
@@ -536,4 +536,3 @@ def build_overview_table(analysis_rows: List[Dict[str, Any]]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(data)
-
