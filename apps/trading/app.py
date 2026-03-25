@@ -4,8 +4,10 @@ import json
 import math
 import os
 import re
+import sys
 import time as pytime
 from datetime import datetime, time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -20,11 +22,24 @@ from streamlit.components.v1 import html
 from fast_engine import fetch_fast_panel
 from slow_engine import (
     add_stock_by_query,
+    get_stock_pool,
     get_latest_fundamental_snapshot,
     get_stock_group_map,
     init_db,
     remove_stock_from_pool,
     update_fundamental_data,
+)
+
+CURRENT_DIR = Path(__file__).resolve().parent
+FUNDAMENTAL_DIR = CURRENT_DIR.parent / "fundamental"
+if str(FUNDAMENTAL_DIR) not in sys.path:
+    sys.path.insert(0, str(FUNDAMENTAL_DIR))
+
+from fundamental_engine import (
+    APP_VERSION as FUND_APP_VERSION,
+    analyze_watchlist as analyze_fundamental_watchlist,
+    build_overview_table as build_fundamental_overview_table,
+    format_pct as format_fundamental_pct,
 )
 
 st.set_page_config(page_title="Quant Dashboard", page_icon="📊", layout="wide")
@@ -67,6 +82,13 @@ DEEPSEEK_QUICK_PROMPT = """你是量化交易快筛分析器。请基于输入JS
 3) 给出 need_full_analysis: true/false
 4) 给出 trigger_reasons 数组（最多4条）
 输出必须是 JSON 对象，不要输出任何额外文字。"""
+FUND_DEEPSEEK_PROMPT = """你是专业基本面分析师。基于输入 JSON 做结构化输出：
+1) 总结（不超过120字）
+2) 八维点评（每维1句）
+3) 关键风险（3条）
+4) 跟踪清单（3条）
+5) 结论：通过 / 观察 / 谨慎（给出理由）
+要求：数据驱动、简洁、中文输出。"""
 
 
 def _load_local_prefs() -> dict:
@@ -186,14 +208,18 @@ st.markdown(
     [data-testid="stSidebar"] span {
         color: #e8eef8 !important;
     }
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]),
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) * {
+    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) {
         background: #dbeafe !important;
         color: #0f2a52 !important;
         border: 1px solid #a8c2e8 !important;
     }
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]):hover,
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]):hover * {
+    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) span,
+    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) p,
+    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) div {
+        color: #0f2a52 !important;
+        -webkit-text-fill-color: #0f2a52 !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]):hover {
         background: #c7ddfb !important;
         color: #0b2346 !important;
     }
@@ -482,14 +508,65 @@ st.markdown(
     .rsi-switch-week .stButton > button { background: #dcfce7 !important; color: #166534 !important; border: 1px solid #86efac !important; }
     .rsi-switch-month .stButton > button { background: #fef3c7 !important; color: #92400e !important; border: 1px solid #fcd34d !important; }
     .rsi-switch-intra .stButton > button { background: #fee2e2 !important; color: #991b1b !important; border: 1px solid #fca5a5 !important; }
+    .score-panel {
+        border: 1px solid rgba(80,120,180,.25);
+        border-radius: 14px;
+        padding: 14px 16px;
+        background: rgba(240,245,255,0.75);
+        min-height: 112px;
+    }
+    .score-panel .label {
+        color: #5a7090;
+        font-size: 1.02rem;
+        font-weight: 700;
+    }
+    .score-panel .value {
+        color: #15253f;
+        font-size: 2.3rem;
+        font-weight: 800;
+        line-height: 1.25;
+        margin-top: 8px;
+    }
+    .fnd-card {
+        border: 1px solid rgba(80,120,180,.25);
+        border-radius: 14px;
+        padding: 12px 14px;
+        min-height: 208px;
+        background: rgba(240,245,255,0.55);
+        display: flex;
+        flex-direction: column;
+    }
+    .fnd-card h4 {
+        margin: 0 0 6px 0;
+        font-size: 1.45rem;
+    }
+    .fnd-card .score {
+        font-size: 1.75rem;
+        font-weight: 800;
+        margin: 2px 0 6px 0;
+    }
+    .fnd-card .desc {
+        color: #5c6e89;
+        font-size: 1.0rem;
+        line-height: 1.42;
+        min-height: 4.26em;
+    }
+    .fnd-card .desc .line {
+        display: block;
+        min-height: 1.42em;
+    }
+    .fnd-card .desc .line-empty {
+        visibility: hidden;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("股票观察面板")
-
 init_db()
+
+if "active_page" not in st.session_state:
+    st.session_state["active_page"] = "trading"
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("股票池管理")
@@ -510,6 +587,21 @@ if add_holding or add_watch:
         st.rerun()
     except Exception as exc:
         st.sidebar.error(f"添加失败: {exc}")
+
+pool_rows_for_sidebar = get_stock_pool()
+pool_name_map = {code: name for code, name in pool_rows_for_sidebar}
+if pool_rows_for_sidebar:
+    remove_code = st.sidebar.selectbox(
+        "删除股票",
+        options=[code for code, _ in pool_rows_for_sidebar],
+        format_func=lambda c: f"{pool_name_map.get(c, c)} ({c})",
+    )
+    if st.sidebar.button("删除选中", use_container_width=True):
+        remove_stock_from_pool(remove_code)
+        if st.session_state.get("fast_selected_code") == remove_code:
+            st.session_state.pop("fast_selected_code", None)
+            st.session_state.pop("fast_selected_name", None)
+        st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("DeepSeek API")
@@ -547,8 +639,17 @@ if _curr_user != _last.get("deepseek_user", "") or _curr_key != _last.get("deeps
         "deepseek_api_key": _curr_key,
     }
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("页面切换")
+if st.sidebar.button("基本面", use_container_width=True, type="primary" if st.session_state["active_page"] == "fundamental" else "secondary"):
+    st.session_state["active_page"] = "fundamental"
+if st.sidebar.button("交易面", use_container_width=True, type="primary" if st.session_state["active_page"] == "trading" else "secondary"):
+    st.session_state["active_page"] = "trading"
+
+st.title("基本面" if st.session_state.get("active_page") == "fundamental" else "股票观察面板")
+
 rows = get_latest_fundamental_snapshot()
-if not rows:
+if st.session_state.get("active_page") == "trading" and not rows:
     st.info("数据库暂无慢引擎快照，请先在左侧添加股票。")
     st.stop()
 
@@ -897,6 +998,246 @@ def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
     )
 
 
+def _call_deepseek_fundamental(json_text: str) -> tuple[str, dict, float, float]:
+    return _call_deepseek_with_prompt(
+        user_content=json_text,
+        system_prompt=FUND_DEEPSEEK_PROMPT,
+        max_tokens=1200,
+        temperature=0.3,
+        top_p=0.9,
+    )
+
+
+def _clean_text_no_na(text: str) -> str:
+    s = str(text or "")
+    for bad in ["N/A", "n/a", "nan", "None", "--", "null"]:
+        s = s.replace(bad, "")
+    return re.sub(r"\s+", " ", s).strip(" ，。；、")
+
+
+def _split_sentences(text: str):
+    clean = _clean_text_no_na(text)
+    if not clean:
+        return []
+    parts = re.split(r"[。！？；\n]+", clean)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _format_card_desc_lines(text: str, max_lines: int = 3) -> str:
+    raw = _clean_text_no_na(text)
+    if not raw:
+        lines = []
+    else:
+        parts = re.split(r"[\/／|]+", raw)
+        lines = []
+        for part in parts:
+            sub = _split_sentences(part)
+            if sub:
+                lines.extend(sub)
+        lines = [x.strip() for x in lines if x.strip()]
+    lines = lines[:max_lines]
+    while len(lines) < max_lines:
+        lines.append("")
+    html_lines = []
+    for one in lines:
+        if one:
+            html_lines.append(f"<span class='line'>{one}</span>")
+        else:
+            html_lines.append("<span class='line line-empty'>.</span>")
+    return "".join(html_lines)
+
+
+def _shared_watchlist_rows():
+    pool_rows = get_stock_pool()
+    group_map = get_stock_group_map()
+    out = []
+    for code, name in pool_rows:
+        out.append(
+            {
+                "code": str(code),
+                "name": str(name).strip() or str(code),
+                "type": "持仓" if group_map.get(str(code), "watch") == "holding" else "观察",
+            }
+        )
+    return out
+
+
+def _ensure_fundamental_state(force_refresh: bool = False):
+    if "fnd_deepseek_reports" not in st.session_state:
+        st.session_state["fnd_deepseek_reports"] = {}
+    watchlist = _shared_watchlist_rows()
+    hash_text = json.dumps(watchlist, ensure_ascii=False, sort_keys=True)
+    wl_hash = hashlib.md5(hash_text.encode("utf-8")).hexdigest()
+
+    stale = (
+        force_refresh
+        or "fnd_rows" not in st.session_state
+        or st.session_state.get("fnd_watchlist_hash", "") != wl_hash
+    )
+    if stale:
+        st.session_state["fnd_rows"] = analyze_fundamental_watchlist(watchlist, force_refresh=force_refresh)
+        st.session_state["fnd_watchlist_hash"] = wl_hash
+        if st.session_state["fnd_rows"]:
+            valid_codes = {str(x.get("code", "")) for x in st.session_state["fnd_rows"]}
+            if st.session_state.get("fnd_selected_code") not in valid_codes:
+                st.session_state["fnd_selected_code"] = st.session_state["fnd_rows"][0]["code"]
+        else:
+            st.session_state["fnd_selected_code"] = ""
+    return watchlist, st.session_state.get("fnd_rows", [])
+
+
+def _render_fundamental_page():
+    st.caption(f"版本号: {FUND_APP_VERSION}")
+    top_cols = st.columns([1, 5], vertical_alignment="center")
+    if top_cols[0].button("刷新基本面", use_container_width=True, key="refresh_fundamental_now"):
+        _ensure_fundamental_state(force_refresh=True)
+        st.rerun()
+
+    watchlist, rows_fnd = _ensure_fundamental_state(force_refresh=False)
+    if not watchlist:
+        st.warning("当前股票池为空，请先在左侧添加股票。")
+        return
+    if not rows_fnd:
+        st.info("正在生成基本面数据，请稍后刷新。")
+        return
+
+    st.subheader("股票列表")
+    df = build_fundamental_overview_table(rows_fnd).copy()
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    options = [str(r.get("code", "")) for r in rows_fnd]
+    current = str(st.session_state.get("fnd_selected_code", options[0] if options else ""))
+    idx = options.index(current) if current in options else 0
+    chosen = st.selectbox(
+        "打开评分板",
+        options=options,
+        index=idx,
+        format_func=lambda c: next((f"{x.get('name','')} ({x.get('code','')})" for x in rows_fnd if str(x.get("code","")) == c), c),
+        key="fnd_open_score_select",
+    )
+    if chosen != current:
+        st.session_state["fnd_selected_code"] = chosen
+        st.rerun()
+
+    st.divider()
+    row = next((x for x in rows_fnd if str(x.get("code", "")) == str(st.session_state.get("fnd_selected_code", ""))), rows_fnd[0])
+    st.subheader(f"基本面评分板：{row.get('name', '')}（{row.get('code', '')}）")
+    score = float(row.get("total_score", 0.0) or 0.0)
+    conclusion = _clean_text_no_na(str(row.get("conclusion", "观察")))
+    coverage = format_fundamental_pct(float((row.get("coverage_ratio") or 0.0) * 100.0))
+    sp_cols = st.columns(3, gap="small")
+    for col, (label, value) in zip(sp_cols, [("总分", f"{score:.1f}"), ("结论", conclusion), ("覆盖率", coverage)]):
+        col.markdown(
+            f"""
+<div class="score-panel">
+  <div class="label">{label}</div>
+  <div class="value">{value}</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+    dims = row.get("dimensions", []) or []
+    if dims:
+        st.subheader("八维评分")
+        for i in range(0, len(dims), 4):
+            cols = st.columns(4, gap="small")
+            for j, card in enumerate(dims[i : i + 4]):
+                title = _clean_text_no_na(card.get("title", ""))
+                score_txt = _clean_text_no_na(f"{card.get('score', 0)} / {card.get('max_score', 5)}")
+                desc = _format_card_desc_lines(str(card.get("comment", "")))
+                with cols[j]:
+                    st.markdown(
+                        f"""
+<div class="fnd-card">
+  <h4>{title}</h4>
+  <div class="score">{score_txt}</div>
+  <div class="desc">{desc}</div>
+</div>
+""",
+                        unsafe_allow_html=True,
+                    )
+
+    st.divider()
+    st.subheader("总结性文本")
+    lines = _split_sentences(str(row.get("summary_text", "")))
+    if lines:
+        st.markdown(
+            "<div style='line-height:1.8;color:#243a58;font-size:1.05rem;'>"
+            + "<br>".join(lines)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("暂无总结。")
+
+    code = str(row.get("code", ""))
+    json_payload = json.dumps(row, ensure_ascii=False, indent=2)
+    json_b64 = base64.b64encode(json_payload.encode("utf-8")).decode("ascii")
+    btn1, btn2 = st.columns([1, 1], gap="small")
+    with btn1:
+        html(
+            f"""
+            <div style="margin-top:0.1rem;">
+              <button id="fnd-copy-json-{code}"
+                style="width:100%;height:42px;border-radius:10px;border:1px solid #a8c2e8;background:#dbeafe;color:#0f2a52;font-size:1rem;font-weight:700;cursor:pointer;">
+                复制JSON
+              </button>
+              <div id="fnd-copy-msg-{code}" style="margin-top:0.35rem;color:#2e4b6e;font-size:0.86rem;"></div>
+            </div>
+            <script>
+              const btn = document.getElementById("fnd-copy-json-{code}");
+              const msg = document.getElementById("fnd-copy-msg-{code}");
+              const text = decodeURIComponent(escape(window.atob("{json_b64}")));
+              btn.onclick = async function () {{
+                try {{
+                  await navigator.clipboard.writeText(text);
+                  msg.textContent = "已复制";
+                }} catch(e) {{
+                  msg.textContent = "复制失败，请重试";
+                }}
+              }};
+            </script>
+            """,
+            height=88,
+        )
+    with btn2:
+        if st.button("DeepSeek分析", key=f"fnd_deepseek_{code}", use_container_width=True):
+            progress = st.progress(0, text="正在准备分析任务...")
+            pytime.sleep(0.08)
+            progress.progress(35, text="正在压缩数据...")
+            pytime.sleep(0.08)
+            progress.progress(70, text="正在连接 DeepSeek...")
+            try:
+                report, usage, cost, elapsed = _call_deepseek_fundamental(json_payload)
+                progress.progress(100, text="分析完成")
+                pytime.sleep(0.1)
+                progress.empty()
+                st.session_state["fnd_deepseek_reports"][code] = {
+                    "report": (report or "").strip(),
+                    "usage": usage,
+                    "cost": cost,
+                    "elapsed": elapsed,
+                    "at": datetime.now().strftime("%m-%d %H:%M:%S"),
+                }
+            except Exception as exc:
+                progress.empty()
+                st.error(f"DeepSeek 分析失败: {exc}")
+
+    deep = st.session_state.get("fnd_deepseek_reports", {}).get(code)
+    if deep:
+        st.divider()
+        st.subheader("DeepSeek分析结果")
+        st.caption(
+            f"分析时间: {deep.get('at','')} ｜耗时: {deep.get('elapsed',0):.2f}s ｜"
+            f"Tokens: {deep.get('usage',{}).get('total_tokens',0)} ｜"
+            f"预估成本: {deep.get('cost',0):.4f} 元"
+        )
+        report_text = (deep.get("report", "") or "").strip()
+        st.markdown(report_text)
+        st.text_area("分析文本（可复制）", value=report_text, height=260, key=f"fnd_report_{code}")
+
+
 def _analysis_job_file(job_id: str) -> str:
     return os.path.join(ANALYSIS_JOB_DIR, f"{job_id}.json")
 
@@ -1025,7 +1366,12 @@ def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, heig
         f"深析输入: {stats.get('deep_prompt_tokens', 0)} | 深析输出: {stats.get('deep_completion_tokens', 0)} | "
         f"预估总成本: {float(stats.get('total_cost', 0) or 0):.4f} 元"
     )
-    st.text_area("分析文本", value=final_text, height=height, key=text_key, label_visibility="collapsed")
+    report_text = final_text.strip()
+    if report_text:
+        st.markdown(report_text)
+    else:
+        st.info("暂无分析文本。")
+    st.text_area("分析文本（可复制）", value=report_text, height=min(height, 280), key=text_key)
     final_b64 = base64.b64encode(final_text.encode("utf-8")).decode("ascii")
     html(
         f"""
@@ -1229,6 +1575,11 @@ def _is_market_open(code: str) -> bool:
 
     # A股常规交易时段
     return (time(9, 30) <= t <= time(11, 30)) or (time(13, 0) <= t <= time(15, 0))
+
+
+if st.session_state.get("active_page") == "fundamental":
+    _render_fundamental_page()
+    st.stop()
 
 
 if "fast_selected_code" not in st.session_state:
