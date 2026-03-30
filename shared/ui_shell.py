@@ -5,6 +5,7 @@ from html import escape
 from typing import Sequence
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 @dataclass(frozen=True)
@@ -312,10 +313,11 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
       margin: 0.95rem 0 0.7rem 0;
       color: rgba(255, 247, 239, 0.98);
       font-size: clamp(2.4rem, 6vw, 4.6rem);
-      line-height: 0.98;
+      line-height: 1.02;
       font-family: var(--qs-display);
       font-weight: 700;
-      max-width: 10ch;
+      max-width: none;
+      white-space: nowrap;
     }}
     .qs-subtitle {{
       max-width: 50rem;
@@ -345,9 +347,12 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
       font-weight: 700;
     }}
     .qs-badge.qs-version {{
-      color: #1a2333;
+      color: #162334 !important;
+      -webkit-text-fill-color: #162334 !important;
       background: linear-gradient(135deg, var(--qs-accent-soft), #f6ecdb);
       border-color: rgba(255, 255, 255, 0.12);
+      font-weight: 800;
+      text-shadow: none;
     }}
     .qs-side-column {{
       display: grid;
@@ -386,6 +391,29 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
     }}
     .qs-top-nav-marker {{
       display: none;
+    }}
+    .qs-top-nav-reserve {{
+      height: 5.8rem;
+    }}
+    .st-key-qs_top_nav_row {{
+      position: relative;
+      z-index: 60;
+      margin: 0;
+      padding: 0.7rem 0.75rem 0.8rem;
+      border-radius: 28px;
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      background:
+        linear-gradient(180deg, rgba(11, 21, 36, 0.84), rgba(8, 17, 29, 0.74)),
+        radial-gradient(circle at top left, rgba(255,255,255,0.08), transparent 28%);
+      backdrop-filter: blur(18px);
+      box-shadow:
+        0 14px 34px rgba(0, 0, 0, 0.20),
+        inset 0 1px 0 rgba(255,255,255,0.06);
+      transition: left 140ms ease, width 140ms ease, top 140ms ease;
+    }}
+    .st-key-qs_top_nav_row > div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {{
+      display: flex;
+      align-items: center;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div[data-testid="stButton"] {{
       margin: 0 !important;
@@ -449,6 +477,21 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
     div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button div {{
       color: #122033 !important;
       -webkit-text-fill-color: #122033 !important;
+    }}
+    @media (max-width: 900px) {{
+      .qs-title {{
+        white-space: normal;
+      }}
+      .qs-top-nav-reserve {{
+        height: 5.1rem;
+      }}
+      .st-key-qs_top_nav_row {{
+        padding: 0.45rem 0.45rem 0.55rem;
+        border-radius: 22px;
+      }}
+      .st-key-qs_top_nav_row.qs-floating-ready {{
+        top: 0.45rem;
+      }}
     }}
     .qs-section-intro {{
       display: grid;
@@ -912,14 +955,64 @@ def render_app_shell(
 
 
 def render_top_nav(active_page: str) -> str:
-    cols = st.columns([1.05, 1.05, 1.05, 4.2], vertical_alignment="center")
     selected = active_page
-    for idx, key in enumerate(_NAV_ORDER):
-        with cols[idx]:
-            marker_class = "qs-top-nav-marker is-active" if key == active_page else "qs-top-nav-marker"
-            st.markdown(f"<div class='{marker_class}'></div>", unsafe_allow_html=True)
-            if st.button(_SHELLS[key].nav_title, key=f"qs_top_nav_{key}", use_container_width=True):
-                selected = key
+    st.markdown("<div class='qs-top-nav-reserve'></div>", unsafe_allow_html=True)
+    with st.container(key="qs_top_nav_row"):
+        cols = st.columns([1.05, 1.05, 1.05, 4.2], vertical_alignment="center")
+        for idx, key in enumerate(_NAV_ORDER):
+            with cols[idx]:
+                marker_class = "qs-top-nav-marker is-active" if key == active_page else "qs-top-nav-marker"
+                st.markdown(f"<div class='{marker_class}'></div>", unsafe_allow_html=True)
+                if st.button(_SHELLS[key].nav_title, key=f"qs_top_nav_{key}", use_container_width=True):
+                    selected = key
+    components.html(
+        """
+        <script>
+        const syncTopNav = () => {
+          try {
+            const doc = window.parent.document;
+            const nav =
+              doc.querySelector('.st-key-qs_top_nav_row') ||
+              doc.querySelector('[class*="st-key-qs_top_nav_row"]');
+            const main =
+              doc.querySelector('[data-testid="stAppViewContainer"] .main .block-container') ||
+              doc.querySelector('.main .block-container') ||
+              doc.querySelector('.block-container');
+            const reserve = doc.querySelector('.qs-top-nav-reserve');
+            if (!nav || !main || !reserve) return;
+
+            const rect = main.getBoundingClientRect();
+            nav.style.position = 'fixed';
+            nav.style.left = `${Math.round(rect.left)}px`;
+            nav.style.top = window.innerWidth <= 900 ? '0.45rem' : '0.85rem';
+            nav.style.width = `${Math.round(rect.width)}px`;
+            nav.style.margin = '0';
+            nav.style.zIndex = '60';
+            nav.style.transform = 'none';
+
+            reserve.style.height = `${Math.ceil(nav.getBoundingClientRect().height + 12)}px`;
+          } catch (err) {
+            // keep silent; the loop below will retry after Streamlit rerenders
+          }
+        };
+
+        const bindTopNav = () => {
+          syncTopNav();
+          window.parent.addEventListener('resize', syncTopNav, { passive: true });
+          window.parent.addEventListener('scroll', syncTopNav, { passive: true });
+          const observer = new MutationObserver(() => syncTopNav());
+          observer.observe(window.parent.document.body, { childList: true, subtree: true });
+          setInterval(syncTopNav, 500);
+          setTimeout(syncTopNav, 120);
+          setTimeout(syncTopNav, 600);
+          setTimeout(syncTopNav, 1400);
+        };
+
+        bindTopNav();
+        </script>
+        """,
+        height=0,
+    )
     return selected
 
 

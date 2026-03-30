@@ -497,6 +497,14 @@ st.markdown(
         line-height: 1.25;
         margin-top: 8px;
     }
+    .fnd-focus-title {
+        margin: 0 0 1.35rem 0;
+        color: rgba(255, 248, 241, 0.98);
+        font-size: 2.35rem;
+        line-height: 1.1;
+        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+        font-weight: 700;
+    }
     .fnd-card {
         border: 1px solid rgba(255,255,255,0.10);
         border-radius: 14px;
@@ -529,6 +537,59 @@ st.markdown(
     }
     .fnd-card .desc .line-empty {
         visibility: hidden;
+    }
+    .fnd-overview-head {
+        color: rgba(230, 221, 208, 0.72);
+        font-size: 1rem;
+        font-weight: 700;
+        padding: 0 0 0.45rem 0;
+    }
+    .fnd-overview-cell {
+        color: rgba(246, 239, 229, 0.94);
+        font-size: 1rem;
+        line-height: 1.2;
+        padding-top: 0.45rem;
+    }
+    .fnd-overview-cell.is-muted {
+        color: rgba(222, 214, 202, 0.78);
+    }
+    .fnd-overview-row-divider {
+        height: 1px;
+        background: rgba(255,255,255,0.10);
+        margin: 0;
+    }
+    [class*="st-key-tr_fnd_name_wrap_"] {
+        padding-top: 0.35rem;
+    }
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton {
+        margin: 0 !important;
+    }
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton > button,
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton > button:hover,
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton > button:focus,
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton > button:active {
+        min-height: 1.9rem !important;
+        height: 1.9rem !important;
+        padding: 0 1rem !important;
+        border-radius: 999px !important;
+        border: 1px solid rgba(196, 235, 232, 0.72) !important;
+        background: linear-gradient(180deg, rgba(139, 198, 194, 0.98), rgba(101, 160, 157, 1)) !important;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 8px 18px rgba(0,0,0,0.10) !important;
+        justify-content: center !important;
+        color: #122033 !important;
+        -webkit-text-fill-color: #122033 !important;
+        font-size: 1rem !important;
+        font-weight: 800 !important;
+    }
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton > button span,
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton > button p,
+    [class*="st-key-tr_fnd_name_wrap_"] div.stButton > button div {
+        color: #122033 !important;
+        -webkit-text-fill-color: #122033 !important;
+    }
+    [class*="st-key-tr_fnd_name_wrap_active_"] div.stButton > button {
+        border-color: rgba(232, 246, 244, 0.92) !important;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 0 0 1px rgba(255,255,255,0.10), 0 10px 20px rgba(0,0,0,0.12) !important;
     }
     </style>
     """,
@@ -1142,31 +1203,38 @@ def _render_fundamental_page():
     )
     st.subheader("股票列表")
     df = build_fundamental_overview_table(rows_fnd).copy()
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    widths = [1.0, 1.15, 0.75, 0.75, 0.85, 1.35]
+    header_cols = st.columns(widths, gap="small")
+    for col, header in zip(header_cols, df.columns):
+        col.markdown(f"<div class='fnd-overview-head'>{header}</div>", unsafe_allow_html=True)
+    st.markdown("<div class='fnd-overview-row-divider'></div>", unsafe_allow_html=True)
 
-    options = [str(r.get("code", "")) for r in rows_fnd]
-    current = str(st.session_state.get("fnd_selected_code", options[0] if options else ""))
-    idx = options.index(current) if current in options else 0
-    chosen = st.selectbox(
-        "打开评分板",
-        options=options,
-        index=idx,
-        format_func=lambda c: next((f"{x.get('name','')} ({x.get('code','')})" for x in rows_fnd if str(x.get("code","")) == c), c),
-        key="fnd_open_score_select",
-    )
-    if chosen != current:
-        st.session_state["fnd_selected_code"] = chosen
-        st.rerun()
+    selected_code = str(st.session_state.get("fnd_selected_code", rows_fnd[0].get("code", "") if rows_fnd else ""))
+    for row in rows_fnd:
+        cols = st.columns(widths, gap="small")
+        cols[0].markdown(f"<div class='fnd-overview-cell'>{row.get('code', '')}</div>", unsafe_allow_html=True)
+        with cols[1]:
+            wrap_key = (
+                f"tr_fnd_name_wrap_active_{row.get('code', '')}"
+                if str(row.get("code", "")) == selected_code
+                else f"tr_fnd_name_wrap_{row.get('code', '')}"
+            )
+            with st.container(key=wrap_key):
+                if st.button(str(row.get("name", "")), key=f"tr_fnd_name_pick_{row.get('code', '')}", type="tertiary"):
+                    st.session_state["fnd_selected_code"] = row.get("code", "")
+                    st.rerun()
+        cols[2].markdown(f"<div class='fnd-overview-cell'>{row.get('total_score', '')}</div>", unsafe_allow_html=True)
+        cols[3].markdown(f"<div class='fnd-overview-cell'>{row.get('type', '')}</div>", unsafe_allow_html=True)
+        cols[4].markdown(f"<div class='fnd-overview-cell'>{format_fundamental_pct(row.get('dividend_yield'))}</div>", unsafe_allow_html=True)
+        cols[5].markdown(f"<div class='fnd-overview-cell is-muted'>{row.get('analysis_at', '')}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='fnd-overview-row-divider'></div>", unsafe_allow_html=True)
 
     st.divider()
     row = next((x for x in rows_fnd if str(x.get("code", "")) == str(st.session_state.get("fnd_selected_code", ""))), rows_fnd[0])
-    render_section_intro(
-        "评分概览",
-        "先看总分与结论，再往下阅读八维解释和总结文本，会更接近真实的研究顺序。",
-        kicker="Scoreboard",
-        pills=("总分", "结论", "覆盖率"),
+    st.markdown(
+        f"<div class='fnd-focus-title'>{row.get('name', '')}（{row.get('code', '')}）</div>",
+        unsafe_allow_html=True,
     )
-    st.subheader(f"基本面评分板：{row.get('name', '')}（{row.get('code', '')}）")
     score = float(row.get("total_score", 0.0) or 0.0)
     conclusion = _clean_text_no_na(str(row.get("conclusion", "观察")))
     coverage = format_fundamental_pct(float((row.get("coverage_ratio") or 0.0) * 100.0))
