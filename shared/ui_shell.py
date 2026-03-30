@@ -10,6 +10,7 @@ import streamlit as st
 @dataclass(frozen=True)
 class ShellMeta:
     label: str
+    nav_title: str
     title: str
     subtitle: str
     accent: str
@@ -19,34 +20,9 @@ class ShellMeta:
 
 
 _SHELLS: dict[str, ShellMeta] = {
-    "trading": ShellMeta(
-        label="Trading Deck",
-        title="交易总控台",
-        subtitle="把股票池、盘口、分时、快照和 DeepSeek 研判收拢进一张真正可操作的交易桌面。",
-        accent="#d9a766",
-        accent_soft="#f3d7b0",
-        glow="rgba(217, 167, 102, 0.22)",
-        metrics=(
-            ("主视角", "实时盯盘"),
-            ("信息层级", "盘口 + 分时 + AI"),
-            ("工作方式", "围绕持仓/观察池"),
-        ),
-    ),
-    "fundamental": ShellMeta(
-        label="Fundamental Atlas",
-        title="基本面研究台",
-        subtitle="用更清晰的层次组织八维评分、摘要结论和观察名单，让研究过程更像一块分析桌面而不是表单堆叠。",
-        accent="#5da6a7",
-        accent_soft="#bfe3df",
-        glow="rgba(93, 166, 167, 0.24)",
-        metrics=(
-            ("主视角", "八维评分"),
-            ("信息层级", "概览 + 维度 + 结论"),
-            ("工作方式", "长期观察与复盘"),
-        ),
-    ),
     "filter": ShellMeta(
         label="Signal Sieve",
+        nav_title="大过滤器",
         title="筛选指挥台",
         subtitle="先排雷，再精选。把复杂参数折叠成更有节奏的筛选流程，同时保留专业用户需要的控制力度。",
         accent="#7fa36b",
@@ -58,18 +34,40 @@ _SHELLS: dict[str, ShellMeta] = {
             ("工作方式", "批量筛选与导出"),
         ),
     ),
+    "fundamental": ShellMeta(
+        label="Fundamental Atlas",
+        nav_title="基本面分析",
+        title="基本面研究台",
+        subtitle="用更清晰的层次组织八维评分、摘要结论和观察名单，让研究过程更像一块分析桌面而不是表单堆叠。",
+        accent="#5da6a7",
+        accent_soft="#bfe3df",
+        glow="rgba(93, 166, 167, 0.24)",
+        metrics=(
+            ("主视角", "八维评分"),
+            ("信息层级", "概览 + 维度 + 结论"),
+            ("工作方式", "长期观察与复盘"),
+        ),
+    ),
+    "trading": ShellMeta(
+        label="Trading Deck",
+        nav_title="交易面分析",
+        title="交易总控台",
+        subtitle="把股票池、盘口、分时、快照和 DeepSeek 研判收拢进一张真正可操作的交易桌面。",
+        accent="#d9a766",
+        accent_soft="#f3d7b0",
+        glow="rgba(217, 167, 102, 0.22)",
+        metrics=(
+            ("主视角", "实时盯盘"),
+            ("信息层级", "盘口 + 分时 + AI"),
+            ("工作方式", "围绕持仓/观察池"),
+        ),
+    ),
 }
+
+_NAV_ORDER = ("filter", "fundamental", "trading")
 
 
 def _shell_style(meta: ShellMeta, active_page: str) -> str:
-    nav_items = []
-    for key, item in _SHELLS.items():
-        state = "is-active" if key == active_page else ""
-        nav_items.append(
-            f"<span class='qs-nav-pill {state}'>{escape(item.title)}</span>"
-        )
-
-    nav_html = "".join(nav_items)
     return f"""
     <style>
     :root {{
@@ -379,30 +377,78 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
       line-height: 1.4;
       font-weight: 700;
     }}
-    .qs-nav {{
+    .qs-top-nav {{
       display: flex;
-      flex-wrap: wrap;
-      gap: 0.6rem;
-      margin-top: 1.1rem;
-    }}
-    .qs-nav-pill {{
-      display: inline-flex;
+      gap: 1rem;
       align-items: center;
-      min-height: 2.2rem;
-      padding: 0.35rem 0.95rem;
-      border-radius: 999px;
-      border: 1px solid rgba(255, 255, 255, 0.10);
-      background: rgba(255, 255, 255, 0.04);
-      color: rgba(228, 236, 244, 0.84) !important;
-      -webkit-text-fill-color: rgba(228, 236, 244, 0.84) !important;
-      font-size: 0.8rem;
-      font-weight: 700;
+      margin: 1.05rem 0 0.95rem 0;
+      flex-wrap: wrap;
     }}
-    .qs-nav-pill.is-active {{
-      background: linear-gradient(135deg, rgba(255,255,255,0.14), rgba(255,255,255,0.07));
-      border-color: color-mix(in srgb, var(--qs-accent) 65%, white 35%);
-      color: rgba(255, 248, 239, 0.96);
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.04);
+    .qs-top-nav-marker {{
+      display: none;
+    }}
+    div[data-testid="column"]:has(.qs-top-nav-marker) div[data-testid="stButton"] {{
+      margin: 0 !important;
+    }}
+    div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button {{
+      min-height: 3.55rem !important;
+      width: 100% !important;
+      border-radius: 999px !important;
+      border: 1.5px solid rgba(255, 255, 255, 0.18) !important;
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.08),
+        0 8px 18px rgba(0,0,0,0.12) !important;
+      color: #122033 !important;
+      -webkit-text-fill-color: #122033 !important;
+      font-size: 0.98rem !important;
+      font-weight: 800 !important;
+      letter-spacing: 0.01em;
+      padding: 0 1.75rem !important;
+      opacity: 0.96;
+      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, opacity 160ms ease;
+      transform: none !important;
+    }}
+    div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button span,
+    div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button p,
+    div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button div {{
+      color: #122033 !important;
+      -webkit-text-fill-color: #122033 !important;
+    }}
+    .st-key-qs_top_nav_filter div.stButton > button {{
+      background:
+        linear-gradient(180deg, rgba(175, 193, 131, 0.98), rgba(145, 162, 106, 1)) !important;
+      border-color: rgba(218, 229, 188, 0.72) !important;
+    }}
+    .st-key-qs_top_nav_fundamental div.stButton > button {{
+      background:
+        linear-gradient(180deg, rgba(139, 198, 194, 0.98), rgba(101, 160, 157, 1)) !important;
+      border-color: rgba(196, 235, 232, 0.72) !important;
+    }}
+    .st-key-qs_top_nav_trading div.stButton > button {{
+      background:
+        linear-gradient(180deg, rgba(225, 193, 138, 0.98), rgba(195, 154, 93, 1)) !important;
+      border-color: rgba(245, 221, 180, 0.76) !important;
+    }}
+    div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button:hover {{
+      opacity: 1;
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.10),
+        0 12px 24px rgba(0,0,0,0.15) !important;
+      transform: none !important;
+    }}
+    div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button {{
+      border-color: rgba(255, 248, 236, 0.92) !important;
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.12),
+        0 0 0 1px rgba(255,255,255,0.12),
+        0 14px 30px rgba(0,0,0,0.18) !important;
+      opacity: 1;
+    }}
+    div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button span,
+    div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button p,
+    div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button div {{
+      color: #122033 !important;
+      -webkit-text-fill-color: #122033 !important;
     }}
     .qs-section-intro {{
       display: grid;
@@ -819,7 +865,6 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
       }}
     }}
     </style>
-    <div class="qs-nav" aria-hidden="true">{nav_html}</div>
     """
 
 
@@ -864,6 +909,18 @@ def render_app_shell(
     </section>
     """
     st.markdown(shell_html, unsafe_allow_html=True)
+
+
+def render_top_nav(active_page: str) -> str:
+    cols = st.columns([1.05, 1.05, 1.05, 4.2], vertical_alignment="center")
+    selected = active_page
+    for idx, key in enumerate(_NAV_ORDER):
+        with cols[idx]:
+            marker_class = "qs-top-nav-marker is-active" if key == active_page else "qs-top-nav-marker"
+            st.markdown(f"<div class='{marker_class}'></div>", unsafe_allow_html=True)
+            if st.button(_SHELLS[key].nav_title, key=f"qs_top_nav_{key}", use_container_width=True):
+                selected = key
+    return selected
 
 
 def render_section_intro(

@@ -87,7 +87,7 @@ from filter_engine import (
     refresh_market_snapshot as filter_refresh_market_snapshot,
     save_template as filter_save_template,
 )
-from shared.ui_shell import render_app_shell, render_section_intro, render_status_row
+from shared.ui_shell import render_app_shell, render_section_intro, render_status_row, render_top_nav
 
 st.set_page_config(page_title="Quant Dashboard", page_icon="📊", layout="wide")
 APP_VERSION = "QDB-20260327-FLT5Y-01"
@@ -595,12 +595,10 @@ if "_prefs_loaded" not in st.session_state:
 
 analysis_user_input = st.sidebar.text_input(
     "用户名（用于区分不同使用者）",
-    value=st.session_state.get("deepseek_user_input", ""),
     key="deepseek_user_input",
 )
 analysis_api_key_input = st.sidebar.text_input(
     "API Key（可留空，读取环境变量）",
-    value=st.session_state.get("deepseek_api_key_input", ""),
     type="password",
     key="deepseek_api_key_input",
 )
@@ -615,15 +613,11 @@ if _curr_user != _last.get("deepseek_user", "") or _curr_key != _last.get("deeps
         "deepseek_api_key": _curr_key,
     }
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("页面切换")
-if st.sidebar.button("基本面", use_container_width=True, type="primary" if st.session_state["active_page"] == "fundamental" else "secondary"):
-    st.session_state["active_page"] = "fundamental"
-if st.sidebar.button("交易面", use_container_width=True, type="primary" if st.session_state["active_page"] == "trading" else "secondary"):
-    st.session_state["active_page"] = "trading"
-if st.sidebar.button("大过滤器", use_container_width=True, type="primary" if st.session_state["active_page"] == "filter" else "secondary"):
-    st.session_state["active_page"] = "filter"
-
+_active_page = st.session_state.get("active_page", "trading")
+_nav_selected = render_top_nav(_active_page)
+if _nav_selected != _active_page:
+    st.session_state["active_page"] = _nav_selected
+    st.rerun()
 _active_page = st.session_state.get("active_page", "trading")
 _group_map = get_stock_group_map()
 _holding_count = sum(1 for code, _name in pool_rows_for_sidebar if _group_map.get(code) == "holding")

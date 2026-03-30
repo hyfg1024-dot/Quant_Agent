@@ -215,12 +215,10 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("DeepSeek API")
 user_input = st.sidebar.text_input(
     "用户名（用于区分不同使用者）",
-    value=st.session_state.get("deepseek_user_input", ""),
     key="deepseek_user_input",
 )
 api_key_input = st.sidebar.text_input(
     "API Key（可留空，读取环境变量）",
-    value=st.session_state.get("deepseek_api_key_input", ""),
     type="password",
     key="deepseek_api_key_input",
 )
