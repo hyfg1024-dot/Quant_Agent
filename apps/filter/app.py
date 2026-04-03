@@ -21,8 +21,11 @@ from filter_engine import (
     apply_filters,
     build_ai_quick_config,
     default_filter_config,
+    export_snapshot_health_excel,
     export_results_excel,
+    get_snapshot_health_report,
     get_snapshot_meta,
+    get_weekly_update_status,
     get_template_config,
     load_snapshot,
     load_templates,
@@ -84,6 +87,8 @@ if "deepseek_user_input" not in st.session_state:
 if "deepseek_api_key_input" not in st.session_state:
     _prefs = _load_local_prefs()
     st.session_state["deepseek_api_key_input"] = _prefs.get("deepseek_api_key", "")
+if "show_ops_panel" not in st.session_state:
+    st.session_state["show_ops_panel"] = False
 
 
 def _has_rearview_enabled(cfg: dict) -> bool:
@@ -137,6 +142,108 @@ def _concat_dedup(df1: pd.DataFrame, df2: pd.DataFrame) -> pd.DataFrame:
         merged = merged.drop_duplicates(subset=["code"], keep="first")
     return merged
 
+
+def _safe_str(v: object) -> str:
+    return str(v).strip() if v is not None else ""
+
+
+def _safe_int(v: object) -> int:
+    try:
+        return int(float(str(v)))
+    except Exception:
+        return 0
+
+
+def _render_ops_panel() -> None:
+    render_section_intro(
+        "数据运维台",
+        "在不改变筛选页面结构的前提下，集中处理 A+H 更新、周更和体检。",
+        kicker="Ops",
+        pills=("安全模式", "A+H", "每周更新", "体检导出"),
+    )
+
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    market_scope = c1.selectbox("市场范围", options=["A", "HK", "AH"], index=2, format_func=lambda x: {"A": "A股", "HK": "港股", "AH": "A+H"}[x], key="ops_market_scope")
+    max_stocks = c2.number_input("更新股票数（0=全部）", min_value=0, max_value=12000, value=0, step=200, key="ops_max_stocks")
+    enrich_n = c3.number_input("深度补充（A股）", min_value=0, max_value=2000, value=800, step=100, key="ops_enrich_n")
+    safe_mode = c4.checkbox("安全模式（防封）", value=True, key="ops_safe_mode")
+    rotate_enrich = st.checkbox("深度补充采用轮转增量（推荐）", value=True, key="ops_rotate")
+    force_refresh = st.checkbox("忽略缓存强制重抓", value=False, key="ops_force")
+
+    weekly = get_weekly_update_status("AH")
+    weekly_state = "已到期可执行" if bool(weekly.get("due")) else f"未到期（剩余{float(weekly.get('remaining_hours', 0.0)):.1f}小时）"
+    st.caption(
+        f"周更(A+H)上次: {weekly.get('last') or '--'} ｜ 下次到期: {weekly.get('next_due') or '立即可执行'} ｜ 当前状态: {weekly_state}"
+    )
+
+    u1, u2 = st.columns(2)
+    if u1.button("运行一次更新（运维台）", use_container_width=True):
+        with st.spinner("正在执行运维更新..."):
+            try:
+                stats = refresh_market_snapshot(
+                    max_stocks=int(max_stocks),
+                    enrich_top_n=int(enrich_n),
+                    force_refresh=bool(force_refresh),
+                    rotate_enrich=bool(rotate_enrich),
+                    market_scope=str(market_scope),
+                    weekly_mode=False,
+                    safe_mode=bool(safe_mode),
+                )
+                if bool(stats.get("fallback", False)):
+                    st.warning("本次未连通接口，已回退本地快照。")
+                else:
+                    st.success(
+                        f"更新完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
+                    )
+                    st.caption(f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ 重抓: {int(stats.get('cache_miss', 0) or 0)}")
+            except Exception as exc:
+                st.error(f"更新失败: {exc}")
+
+    if u2.button("执行周更（A+H，7天一次）", use_container_width=True):
+        with st.spinner("正在执行周更..."):
+            try:
+                stats = refresh_market_snapshot(
+                    max_stocks=0,
+                    enrich_top_n=int(enrich_n),
+                    force_refresh=False,
+                    rotate_enrich=True,
+                    market_scope="AH",
+                    weekly_mode=True,
+                    safe_mode=True,
+                )
+                if bool(stats.get("skipped", False)):
+                    st.info(_safe_str(stats.get("reason", "周更间隔未到，本次跳过")))
+                elif bool(stats.get("fallback", False)):
+                    st.warning("周更回退到本地快照。")
+                else:
+                    st.success(
+                        f"周更完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
+                    )
+            except Exception as exc:
+                st.error(f"周更失败: {exc}")
+
+    report = get_snapshot_health_report(days=7, top_n=20)
+    qc = report.get("quality_counts", {})
+    total = int(report.get("total", 0) or 0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总样本", total)
+    c2.metric("full", int(qc.get("full", 0) or 0))
+    c3.metric("partial", int(qc.get("partial", 0) or 0))
+    c4.metric("missing", int(qc.get("missing", 0) or 0))
+    st.progress(float(report.get("coverage_ratio", 0.0) or 0.0), text=f"覆盖率 {(float(report.get('coverage_ratio', 0.0) or 0.0) * 100):.1f}%")
+
+    diag_xlsx = export_snapshot_health_excel(days=30, top_n=50)
+    st.download_button(
+        "导出体检报告（Excel）",
+        data=diag_xlsx,
+        file_name=f"filter_health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    with st.expander("查看体检详情", expanded=False):
+        st.dataframe(report.get("trend_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+        st.dataframe(report.get("runs_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+
 meta = get_snapshot_meta()
 render_app_shell(
     "filter",
@@ -161,6 +268,9 @@ render_status_row(
         ("深度补充", f"{int(meta.get('enriched_count', 0) or 0)} 只" if meta else "0 只"),
     )
 )
+
+if st.session_state["show_ops_panel"]:
+    _render_ops_panel()
 
 # Sidebar: update
 st.sidebar.markdown("---")
@@ -239,6 +349,11 @@ if (
 ):
     _save_local_prefs(_current_prefs["deepseek_user"], _current_prefs["deepseek_api_key"])
 st.sidebar.caption("已本地保存，不会上传到 GitHub。")
+if st.sidebar.button(
+    "打开数据运维台" if not st.session_state["show_ops_panel"] else "收起数据运维台",
+    use_container_width=True,
+):
+    st.session_state["show_ops_panel"] = not bool(st.session_state["show_ops_panel"])
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("筛选模式")
@@ -320,6 +435,22 @@ with st.expander("C. 行业、分红、流动性与规模", expanded=True):
     v = cfg["valuation"]
     g = cfg["growth_liquidity"]
 
+    scope_map = {"all": "全部市场", "A": "仅A股", "HK": "仅港股"}
+    raw_scope = _safe_str(r.get("market_scope", "all")).upper()
+    scope_value = "all" if raw_scope not in {"A", "HK"} else raw_scope
+    r["market_scope"] = c1.selectbox(
+        "筛选市场范围",
+        options=["all", "A", "HK"],
+        index=["all", "A", "HK"].index(scope_value),
+        format_func=lambda x: scope_map.get(x, x),
+    )
+    r["industry_include_enabled"] = c1.checkbox("启用行业关键词包含", value=bool(r.get("industry_include_enabled", False)))
+    r["industry_include_keywords"] = c1.text_input(
+        "行业关键词（包含，逗号分隔）",
+        value=str(r.get("industry_include_keywords", "")),
+    )
+    if str(r.get("industry_include_keywords", "")).strip():
+        r["industry_include_enabled"] = True
     r["exclude_sunset_industry"] = c1.checkbox("排除夕阳行业", value=bool(r.get("exclude_sunset_industry", False)))
     r["sunset_industries"] = c1.text_area("夕阳行业关键词（逗号分隔）", value=str(r.get("sunset_industries", "")), height=120)
     r["pledge_ratio_max_enabled"] = c1.checkbox("启用质押率上限(%)", value=bool(r.get("pledge_ratio_max_enabled", False)))

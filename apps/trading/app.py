@@ -79,9 +79,12 @@ from filter_engine import (
     apply_filters as filter_apply_filters,
     build_ai_quick_config as filter_build_ai_quick_config,
     default_filter_config as filter_default_filter_config,
+    export_snapshot_health_excel as filter_export_snapshot_health_excel,
     export_results_excel as filter_export_results_excel,
+    get_snapshot_health_report as filter_get_snapshot_health_report,
     get_snapshot_meta as filter_get_snapshot_meta,
     get_template_config as filter_get_template_config,
+    get_weekly_update_status as filter_get_weekly_update_status,
     load_snapshot as filter_load_snapshot,
     load_templates as filter_load_templates,
     refresh_market_snapshot as filter_refresh_market_snapshot,
@@ -618,6 +621,8 @@ if "flt_cfg" not in st.session_state:
     st.session_state["flt_cfg"] = filter_default_filter_config()
 if "flt_result" not in st.session_state:
     st.session_state["flt_result"] = None
+if "flt_show_ops_panel" not in st.session_state:
+    st.session_state["flt_show_ops_panel"] = False
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("股票池管理")
@@ -1453,17 +1458,148 @@ def _concat_dedup(df1: pd.DataFrame, df2: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
+def _safe_str(v: object) -> str:
+    return str(v).strip() if v is not None else ""
+
+
+def _safe_int(v: object) -> int:
+    try:
+        return int(float(str(v)))
+    except Exception:
+        return 0
+
+
+def _display_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    out = df.copy()
+    out = out.replace({None: "-", "None": "-", "nan": "-", "NaN": "-", "N/A": "-"})
+    out = out.fillna("-")
+    return out
+
+
+def _render_filter_ops_panel() -> None:
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1], vertical_alignment="bottom")
+    market_scope = c1.selectbox(
+        "市场范围",
+        options=["A", "HK", "AH"],
+        index=2,
+        format_func=lambda x: {"A": "A股", "HK": "港股", "AH": "A+H"}[x],
+        key="flt_ops_market_scope",
+    )
+    max_stocks = c2.number_input("更新股票数（0=全部）", min_value=0, max_value=12000, value=0, step=200, key="flt_ops_max_stocks")
+    enrich_n = c3.number_input("深度补充（A股）", min_value=0, max_value=2000, value=800, step=100, key="flt_ops_enrich_n")
+    safe_mode = c4.checkbox("安全模式（防封）", value=True, key="flt_ops_safe_mode")
+    rotate_enrich = st.checkbox("深度补充采用轮转增量（推荐）", value=True, key="flt_ops_rotate")
+    force_refresh = st.checkbox("忽略缓存强制重抓", value=False, key="flt_ops_force")
+
+    weekly = filter_get_weekly_update_status("AH")
+    weekly_state = "已到期可执行" if bool(weekly.get("due")) else f"未到期（剩余{float(weekly.get('remaining_hours', 0.0)):.1f}小时）"
+    st.caption(
+        f"周更(A+H)上次: {weekly.get('last') or '--'} ｜ 下次到期: {weekly.get('next_due') or '立即可执行'} ｜ 当前状态: {weekly_state}"
+    )
+
+    u1, u2 = st.columns(2)
+    if u1.button("运行一次更新（运维台）", use_container_width=True, key="flt_ops_run_once"):
+        with st.spinner("正在执行运维更新..."):
+            try:
+                stats = filter_refresh_market_snapshot(
+                    max_stocks=int(max_stocks),
+                    enrich_top_n=int(enrich_n),
+                    force_refresh=bool(force_refresh),
+                    rotate_enrich=bool(rotate_enrich),
+                    market_scope=str(market_scope),
+                    weekly_mode=False,
+                    safe_mode=bool(safe_mode),
+                )
+                if bool(stats.get("fallback", False)):
+                    st.warning("本次未连通接口，已回退本地快照。")
+                else:
+                    st.success(
+                        f"更新完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
+                    )
+                    st.caption(f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ 重抓: {int(stats.get('cache_miss', 0) or 0)}")
+                st.session_state["flt_result"] = None
+            except Exception as exc:
+                st.error(f"更新失败: {exc}")
+
+    if u2.button("执行周更（A+H，7天一次）", use_container_width=True, key="flt_ops_weekly"):
+        with st.spinner("正在执行周更..."):
+            try:
+                stats = filter_refresh_market_snapshot(
+                    max_stocks=0,
+                    enrich_top_n=int(enrich_n),
+                    force_refresh=False,
+                    rotate_enrich=True,
+                    market_scope="AH",
+                    weekly_mode=True,
+                    safe_mode=True,
+                )
+                if bool(stats.get("skipped", False)):
+                    st.info(_safe_str(stats.get("reason", "周更间隔未到，本次跳过")))
+                elif bool(stats.get("fallback", False)):
+                    st.warning("周更回退到本地快照。")
+                else:
+                    st.success(
+                        f"周更完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
+                    )
+                st.session_state["flt_result"] = None
+            except Exception as exc:
+                st.error(f"周更失败: {exc}")
+
+    report = filter_get_snapshot_health_report(days=7, top_n=20)
+    qc = report.get("quality_counts", {})
+    total = int(report.get("total", 0) or 0)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("总样本", total)
+    m2.metric("full", int(qc.get("full", 0) or 0))
+    m3.metric("partial", int(qc.get("partial", 0) or 0))
+    m4.metric("missing", int(qc.get("missing", 0) or 0))
+    coverage_ratio = float(report.get("coverage_ratio", 0.0) or 0.0)
+    st.progress(coverage_ratio, text=f"覆盖率 {coverage_ratio * 100:.1f}%")
+
+    diag_xlsx = filter_export_snapshot_health_excel(days=30, top_n=50)
+    st.download_button(
+        "导出体检报告（Excel）",
+        data=diag_xlsx,
+        file_name=f"filter_health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="flt_ops_export_health",
+    )
+
+    with st.expander("查看体检详情", expanded=False):
+        st.dataframe(report.get("trend_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+        st.dataframe(report.get("runs_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+
+
 def _render_filter_page():
     st.caption(f"版本号: {FILTER_APP_VERSION} ｜ 侧边栏统一，筛选参数在主区顶部")
 
     cfg = st.session_state.get("flt_cfg", filter_default_filter_config())
     meta = filter_get_snapshot_meta()
     render_section_intro(
-        "筛选作业流",
-        "这一页现在按真实筛选流程组织：先更新快照，再准备模板和条件，最后执行并导出结果。",
+        "数据运维台",
+        "统一处理更新、周更与体检。点击下方按钮即可展开运维区；不展开时保持页面简洁。",
         kicker="Workflow",
-        pills=("更新快照", "模板", "执行筛选", "导出 Excel"),
+        pills=("A+H更新", "周更", "体检", "导出"),
     )
+    st.markdown(
+        """
+        <style>
+        .st-key-flt_ops_toggle_in_filter_header button {
+          font-size: 1.5rem !important;
+          min-height: 3.2rem !important;
+          padding: 0.55rem 1.6rem !important;
+          white-space: nowrap !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    toggle_label = "打开数据运维台" if not bool(st.session_state.get("flt_show_ops_panel", False)) else "收起数据运维台"
+    if st.button(toggle_label, use_container_width=False, key="flt_ops_toggle_in_filter_header"):
+        st.session_state["flt_show_ops_panel"] = not bool(st.session_state.get("flt_show_ops_panel", False))
+        st.rerun()
     render_status_row(
         (
             ("快照状态", meta.get("last_update", "尚未更新") if meta else "尚未更新"),
@@ -1471,57 +1607,90 @@ def _render_filter_page():
             ("深度补充", f"{int(meta.get('enriched_count', 0) or 0)} 只" if meta else "0 只"),
         )
     )
+    if bool(st.session_state.get("flt_show_ops_panel", False)):
+        _render_filter_ops_panel()
+        st.markdown("---")
 
-    st.subheader("过滤器参数")
-    top_cols = st.columns([1.1, 1.1, 0.8, 1.0], vertical_alignment="bottom")
-    max_stocks = top_cols[0].number_input("本次更新股票数（0=全部）", min_value=0, max_value=6000, value=2000, step=100, key="flt_max_stocks_main")
-    enrich_n = top_cols[1].number_input("深度补充数量（调用基本面引擎）", min_value=0, max_value=2000, value=300, step=50, key="flt_enrich_n_main")
-    force_refresh = top_cols[2].checkbox("忽略缓存强制重抓", value=False, key="flt_force_refresh_main")
-    if top_cols[3].button("更新全市场数据", use_container_width=True, key="flt_refresh_market_main"):
-        with st.spinner("正在更新市场数据，请稍候..."):
-            try:
-                stats = filter_refresh_market_snapshot(
-                    max_stocks=int(max_stocks),
-                    enrich_top_n=int(enrich_n),
-                    force_refresh=bool(force_refresh),
-                )
-                if bool(stats.get("fallback", False)):
-                    st.warning(
-                        "本次未连通东财接口，已回退为本地快照（未覆盖旧数据）。"
-                        "请检查系统代理/VPN后再重试。"
+    if bool(st.session_state.get("flt_show_ops_panel", False)):
+        st.subheader("过滤器参数")
+        top_cols = st.columns([1.1, 1.1, 0.8, 1.0], vertical_alignment="bottom")
+        max_stocks = top_cols[0].number_input("本次更新股票数（0=全部）", min_value=0, max_value=6000, value=2000, step=100, key="flt_max_stocks_main")
+        enrich_n = top_cols[1].number_input("深度补充数量（调用基本面引擎）", min_value=0, max_value=2000, value=300, step=50, key="flt_enrich_n_main")
+        force_refresh = top_cols[2].checkbox("忽略缓存强制重抓", value=False, key="flt_force_refresh_main")
+        if top_cols[3].button("更新全市场数据", use_container_width=True, key="flt_refresh_market_main"):
+            with st.spinner("正在更新市场数据，请稍候..."):
+                try:
+                    stats = filter_refresh_market_snapshot(
+                        max_stocks=int(max_stocks),
+                        enrich_top_n=int(enrich_n),
+                        force_refresh=bool(force_refresh),
                     )
-                else:
-                    st.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只")
-                st.session_state["flt_result"] = None
+                    if bool(stats.get("fallback", False)):
+                        st.warning(
+                            "本次未连通东财接口，已回退为本地快照（未覆盖旧数据）。"
+                            "请检查系统代理/VPN后再重试。"
+                        )
+                    else:
+                        st.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只")
+                    st.session_state["flt_result"] = None
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"更新失败: {exc}")
+
+        if meta:
+            st.caption(
+                f"最近更新: {meta.get('last_update', '--')} ｜ "
+                f"样本数量: {meta.get('row_count', '--')} ｜ "
+                f"深度补充: {meta.get('enriched_count', '--')}"
+            )
+
+        tpl_cols = st.columns([1.1, 0.65, 1.0, 0.65], vertical_alignment="bottom")
+        all_tpl = filter_load_templates()
+        tpl_names = sorted(all_tpl.keys())
+        selected_tpl = tpl_cols[0].selectbox("模板", options=["(无)"] + tpl_names, key="flt_tpl_select_main")
+        if tpl_cols[1].button("读取模板", use_container_width=True, key="flt_tpl_load_main"):
+            if selected_tpl and selected_tpl != "(无)":
+                st.session_state["flt_cfg"] = filter_get_template_config(selected_tpl)
+                st.success(f"已加载模板: {selected_tpl}")
                 st.rerun()
+
+        save_tpl_name = tpl_cols[2].text_input("保存为模板名", value="", key="flt_tpl_save_main")
+        if tpl_cols[3].button("保存模板", use_container_width=True, key="flt_tpl_save_btn_main"):
+            try:
+                filter_save_template(save_tpl_name, cfg)
+                st.success("模板已保存")
             except Exception as exc:
-                st.error(f"更新失败: {exc}")
+                st.error(str(exc))
 
-    if meta:
-        st.caption(
-            f"最近更新: {meta.get('last_update', '--')} ｜ "
-            f"样本数量: {meta.get('row_count', '--')} ｜ "
-            f"深度补充: {meta.get('enriched_count', '--')}"
-        )
-
-    tpl_cols = st.columns([1.1, 0.65, 1.0, 0.65], vertical_alignment="bottom")
-    all_tpl = filter_load_templates()
-    tpl_names = sorted(all_tpl.keys())
-    selected_tpl = tpl_cols[0].selectbox("模板", options=["(无)"] + tpl_names, key="flt_tpl_select_main")
-    if tpl_cols[1].button("读取模板", use_container_width=True, key="flt_tpl_load_main"):
-        if selected_tpl and selected_tpl != "(无)":
-            st.session_state["flt_cfg"] = filter_get_template_config(selected_tpl)
-            st.success(f"已加载模板: {selected_tpl}")
-            st.rerun()
-
-    save_tpl_name = tpl_cols[2].text_input("保存为模板名", value="", key="flt_tpl_save_main")
-    if tpl_cols[3].button("保存模板", use_container_width=True, key="flt_tpl_save_btn_main"):
-        try:
-            filter_save_template(save_tpl_name, cfg)
-            st.success("模板已保存")
-        except Exception as exc:
-            st.error(str(exc))
-
+    render_section_intro(
+        "条件矩阵",
+        "筛选条件被拆成四层，从硬排除到五年后视镜，帮助你先做风险清洗，再做估值与长期验证。",
+        kicker="Configuration",
+        pills=("A 硬排除", "B 估值质量", "C 行业规模", "D 五年后视镜"),
+    )
+    st.markdown(
+        """
+        <style>
+        [data-testid="stExpander"] details > summary {
+          background: linear-gradient(180deg, rgba(142, 168, 107, 0.38), rgba(116, 146, 87, 0.34)) !important;
+          border: 1px solid rgba(191, 217, 157, 0.30) !important;
+          border-radius: 999px !important;
+        }
+        [data-testid="stExpander"] details > summary:hover {
+          background: linear-gradient(180deg, rgba(156, 182, 119, 0.46), rgba(126, 156, 95, 0.42)) !important;
+        }
+        [data-testid="stExpander"] details > summary p,
+        [data-testid="stExpander"] details > summary span,
+        [data-testid="stExpander"] details > summary div,
+        [data-testid="stExpander"] details > summary svg {
+          color: rgba(250, 248, 241, 0.98) !important;
+          fill: rgba(250, 248, 241, 0.98) !important;
+          font-weight: 800 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     mode = st.radio("筛选模式", options=["手动筛选", "AI辅助设定"], horizontal=True, key="flt_mode_main")
     if mode == "AI辅助设定":
         render_section_intro(
@@ -1536,13 +1705,6 @@ def _render_filter_page():
             st.session_state["flt_cfg"] = cfg
             st.success("已根据描述生成条件，你可继续微调后执行筛选。")
             st.rerun()
-
-    render_section_intro(
-        "条件矩阵",
-        "筛选条件被拆成四层，从硬排除到五年后视镜，帮助你先做风险清洗，再做估值与长期验证。",
-        kicker="Configuration",
-        pills=("A 硬排除", "B 估值质量", "C 行业规模", "D 五年后视镜"),
-    )
     st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
 
     with st.expander("A. 财务健康度与硬排除", expanded=True):
@@ -1597,6 +1759,22 @@ def _render_filter_page():
         v = cfg["valuation"]
         g = cfg["growth_liquidity"]
 
+        scope_map = {"all": "全部市场", "A": "仅A股", "HK": "仅港股"}
+        raw_scope = _safe_str(r.get("market_scope", "all")).upper()
+        scope_value = "all" if raw_scope not in {"A", "HK"} else raw_scope
+        r["market_scope"] = c1.selectbox(
+            "筛选市场范围",
+            options=["all", "A", "HK"],
+            index=["all", "A", "HK"].index(scope_value),
+            format_func=lambda x: scope_map.get(x, x),
+        )
+        r["industry_include_enabled"] = c1.checkbox("启用行业关键词包含", value=bool(r.get("industry_include_enabled", False)))
+        r["industry_include_keywords"] = c1.text_input(
+            "行业关键词（包含，逗号分隔）",
+            value=str(r.get("industry_include_keywords", "")),
+        )
+        if str(r.get("industry_include_keywords", "")).strip():
+            r["industry_include_enabled"] = True
         r["exclude_sunset_industry"] = c1.checkbox("排除夕阳行业", value=bool(r.get("exclude_sunset_industry", False)))
         r["sunset_industries"] = c1.text_area("夕阳行业关键词（逗号分隔）", value=str(r.get("sunset_industries", "")), height=120)
         r["pledge_ratio_max_enabled"] = c1.checkbox("启用质押率上限(%)", value=bool(r.get("pledge_ratio_max_enabled", False)))
@@ -1770,14 +1948,45 @@ def _render_filter_page():
 
     tab1, tab2, tab3 = st.tabs(["通过池", "排除池", "缺失项"])
     with tab1:
-        cols1 = [c for c in FILTER_DISPLAY_COLUMNS if c in passed_df.columns]
-        st.dataframe(passed_df[cols1] if cols1 else passed_df, use_container_width=True, hide_index=True)
+        t1, t2, t3 = st.columns([1.2, 1.2, 3.6], vertical_alignment="bottom")
+        top_n = int(
+            t1.number_input(
+                "TopN（按总市值）",
+                min_value=0,
+                max_value=2000,
+                value=50,
+                step=10,
+                key="flt_topn_mv_main",
+            )
+        )
+        mv_desc = t2.checkbox("市值降序", value=True, key="flt_mv_desc_main")
+
+        passed_view = passed_df.copy()
+        mv_effective = False
+        if "total_mv" in passed_view.columns:
+            passed_view["_mv_sort"] = pd.to_numeric(passed_view["total_mv"], errors="coerce")
+            mv_effective = bool(passed_view["_mv_sort"].notna().any())
+            passed_view = passed_view.sort_values("_mv_sort", ascending=not mv_desc, na_position="last")
+            passed_view = passed_view.drop(columns=["_mv_sort"], errors="ignore")
+        if (not mv_effective) and ("market" in passed_view.columns):
+            hk_only = passed_view["market"].astype(str).str.upper().eq("HK").all()
+            if hk_only:
+                st.warning("当前港股快照缺少总市值字段，市值排序暂不可用。先执行一次“更新全市场数据（运维台）”后再试。")
+        if top_n > 0:
+            passed_view = passed_view.head(top_n)
+
+        t3.caption(f"展示数量: {len(passed_view)} / {len(passed_df)}")
+        show1 = _display_df(passed_view)
+        cols1 = [c for c in FILTER_DISPLAY_COLUMNS if c in show1.columns]
+        st.dataframe(show1[cols1] if cols1 else show1, use_container_width=True, hide_index=True)
     with tab2:
         cols2 = [c for c in FILTER_DISPLAY_COLUMNS if c in rejected_df.columns]
-        st.dataframe(rejected_df[cols2] if cols2 else rejected_df, use_container_width=True, hide_index=True)
+        show2 = _display_df(rejected_df[cols2] if cols2 else rejected_df)
+        st.dataframe(show2, use_container_width=True, hide_index=True)
     with tab3:
         cols3 = [c for c in FILTER_DISPLAY_COLUMNS if c in missing_df.columns]
-        st.dataframe(missing_df[cols3] if cols3 else missing_df, use_container_width=True, hide_index=True)
+        show3 = _display_df(missing_df[cols3] if cols3 else missing_df)
+        st.dataframe(show3, use_container_width=True, hide_index=True)
 
 
 def _analysis_job_file(job_id: str) -> str:

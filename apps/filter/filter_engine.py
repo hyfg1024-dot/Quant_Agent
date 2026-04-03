@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -39,9 +40,21 @@ DEFAULT_SUNSET_INDUSTRIES = [
     "传统钢铁冶炼",
 ]
 
+INDUSTRY_KEYWORD_ALIAS_MAP: Dict[str, List[str]] = {
+    # 港股地产常见表达
+    "房地产": ["地产", "物业", "reits", "reit"],
+    "地产": ["房地产", "物业", "reits", "reit"],
+    "物业": ["房地产", "地产", "reits", "reit"],
+    "reits": ["reit", "房地产", "地产", "物业"],
+    "reit": ["reits", "房地产", "地产", "物业"],
+}
+
 DEFAULT_FILTER_CONFIG: Dict[str, Any] = {
     "missing_policy": "ignore",  # ignore / exclude
     "risk": {
+        "market_scope": "all",  # all / A / HK
+        "industry_include_enabled": False,
+        "industry_include_keywords": "",
         "exclude_st": True,
         "exclude_investigation": True,
         "exclude_penalty": True,
@@ -125,6 +138,7 @@ DEFAULT_FILTER_CONFIG: Dict[str, Any] = {
 }
 
 DISPLAY_COLUMNS = [
+    "market",
     "code",
     "name",
     "industry",
@@ -248,6 +262,33 @@ def _pick_series(df: pd.DataFrame, names: List[str]) -> pd.Series:
     return pd.Series([None] * len(df), index=df.index)
 
 
+def _clean_text_series(s: pd.Series) -> pd.Series:
+    def _one(v: Any) -> str:
+        if v is None:
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        t = str(v).strip()
+        return "" if t in {"None", "nan", "NaN"} else t
+
+    return s.map(_one)
+
+
+def _normalize_hk_company_code(v: Any) -> str:
+    """
+    港股公司口径：RMB 柜台(8xxxx)并入对应 HKD 柜台(0xxxx)，避免同一公司双柜台重复计数。
+    """
+    text = re.sub(r"\D+", "", _safe_str(v)).zfill(5)
+    if len(text) != 5:
+        return ""
+    if text.startswith("8"):
+        return "0" + text[1:]
+    return text
+
+
 def _snapshot_meta_set(key: str, value: str) -> None:
     with _connect() as conn:
         conn.execute(
@@ -264,11 +305,41 @@ def get_snapshot_meta() -> Dict[str, str]:
     return {str(k): str(v) for k, v in rows}
 
 
+def get_weekly_update_status(market_scope: str = "AH") -> Dict[str, Any]:
+    scope = _safe_str(market_scope).upper() or "AH"
+    meta = get_snapshot_meta()
+    key = f"last_weekly_update_{scope}"
+    last_text = _safe_str(meta.get(key, ""))
+    now = datetime.now()
+    if not last_text:
+        return {"scope": scope, "due": True, "last": "", "next_due": "", "remaining_hours": 0.0}
+    last_dt: Optional[datetime] = None
+    try:
+        last_dt = datetime.fromisoformat(last_text)
+    except Exception:
+        try:
+            last_dt = datetime.strptime(last_text, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            last_dt = None
+    if last_dt is None:
+        return {"scope": scope, "due": True, "last": last_text, "next_due": "", "remaining_hours": 0.0}
+    next_due_dt = last_dt + timedelta(days=7)
+    remaining_hours = max(0.0, (next_due_dt - now).total_seconds() / 3600.0)
+    return {
+        "scope": scope,
+        "due": remaining_hours <= 0,
+        "last": last_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "next_due": next_due_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "remaining_hours": remaining_hours,
+    }
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS market_snapshot (
+                market TEXT,
                 code TEXT PRIMARY KEY,
                 name TEXT,
                 industry TEXT,
@@ -318,6 +389,7 @@ def init_db() -> None:
                 conclusion TEXT,
                 coverage_ratio REAL,
                 data_quality TEXT,
+                enriched_at TEXT,
                 updated_at TEXT,
                 source_note TEXT
             )
@@ -328,6 +400,23 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS snapshot_meta (
                 meta_key TEXT PRIMARY KEY,
                 meta_value TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshot_runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_at TEXT,
+                row_count INTEGER,
+                enriched_count INTEGER,
+                enrich_start INTEGER,
+                enrich_end INTEGER,
+                fallback INTEGER,
+                error_brief TEXT,
+                cache_hit INTEGER,
+                cache_miss INTEGER,
+                enrich_mode TEXT
             )
             """
         )
@@ -411,11 +500,11 @@ def _detect_sunset(industry: str, name: str, keywords: Optional[List[str]] = Non
     return any(w and w in text for w in words)
 
 
-def _enrich_one(code: str, name: str, force_refresh: bool = False) -> Dict[str, Any]:
+def _enrich_one(code: str, name: str, force_refresh: bool = False) -> Tuple[Dict[str, Any], str, Optional[str]]:
     if not force_refresh:
         cached = _load_enrich_cache(code)
         if cached:
-            return cached
+            return cached, "cache", _safe_str(cached.get("cached_at")) or None
 
     result = analyze_fundamental(code=code, name=name, force_refresh=force_refresh, cache_ttl_hours=168)
     payload = {
@@ -453,10 +542,240 @@ def _enrich_one(code: str, name: str, force_refresh: bool = False) -> Dict[str, 
         "audit_opinion": "标准无保留意见",
     }
     _save_enrich_cache(code, payload)
-    return payload
+    return payload, "live", datetime.now().isoformat(timespec="seconds")
 
 
-def _build_base_universe() -> pd.DataFrame:
+def _build_universe_from_spot(spot_df: pd.DataFrame, market: str) -> pd.DataFrame:
+    mkt = _safe_str(market).upper()
+    if mkt == "HK":
+        raw_code = _pick_series(spot_df, ["代码", "证券代码", "symbol", "Symbol"]).astype(str).str.extract(r"(\d+)")[0].fillna("")
+        code = raw_code.map(_normalize_hk_company_code)
+    else:
+        code = _pick_series(spot_df, ["代码"]).astype(str).str.strip().str.zfill(6)
+    name = _clean_text_series(_pick_series(spot_df, ["名称", "股票名称", "简称"]))
+    industry = _clean_text_series(_pick_series(spot_df, ["所处行业", "所属行业", "行业", "industry"]))
+
+    df = pd.DataFrame(
+        {
+            "market": mkt,
+            "code": code,
+            "name": name,
+            "industry": industry,
+            "is_st": name.str.contains("ST", na=False).astype(int),
+            "close_price": _pick_series(spot_df, ["最新价", "最新", "收盘"]).map(_to_float),
+            "price_change_pct": _pick_series(spot_df, ["涨跌幅", "涨跌幅(%)"]).map(_to_float),
+            "amount": _pick_series(spot_df, ["成交额"]).map(_to_float),
+            "pe_dynamic": _pick_series(spot_df, ["市盈率-动态", "市盈率动态", "市盈率"]).map(_to_float),
+            "pb": _pick_series(spot_df, ["市净率"]).map(_to_float),
+            "dividend_yield": _pick_series(spot_df, ["股息率", "股息率(%)"]).map(_to_float),
+            "total_mv": _pick_series(spot_df, ["总市值"]).map(_to_mv_100m),
+            "float_mv": _pick_series(spot_df, ["流通市值"]).map(_to_mv_100m),
+            "turnover_ratio": _pick_series(spot_df, ["换手率"]).map(_to_float),
+            "volume_ratio": _pick_series(spot_df, ["量比"]).map(_to_float),
+        }
+    )
+    df = df[df["code"].astype(str).str.len() > 0].copy()
+    if mkt == "HK":
+        # 同公司双柜台去重，优先保留成交额/市值更完整的一条。
+        df["_amt_sort"] = pd.to_numeric(df["amount"], errors="coerce")
+        df["_mv_sort"] = pd.to_numeric(df["total_mv"], errors="coerce")
+        df = (
+            df.sort_values(by=["_amt_sort", "_mv_sort", "code"], ascending=[False, False, True], na_position="last")
+            .drop_duplicates(subset=["code"], keep="first")
+            .drop(columns=["_amt_sort", "_mv_sort"], errors="ignore")
+            .reset_index(drop=True)
+        )
+    df["pe_ttm"] = df["pe_dynamic"]
+    df["pe_static"] = None
+    df["roe"] = None
+    df["gross_margin"] = None
+    df["net_margin"] = None
+    df["asset_liability_ratio"] = None
+    df["current_ratio"] = None
+    df["operating_cashflow_3y"] = None
+    df["receivable_revenue_ratio"] = None
+    df["goodwill_equity_ratio"] = None
+    df["interest_debt_asset_ratio"] = None
+    df["ev_ebitda"] = None
+    df["revenue_growth"] = None
+    df["profit_growth"] = None
+    df["revenue_cagr_5y"] = None
+    df["profit_cagr_5y"] = None
+    df["roe_avg_5y"] = None
+    df["debt_ratio_avg_5y"] = None
+    df["gross_margin_avg_5y"] = None
+    df["debt_ratio_change_5y"] = None
+    df["gross_margin_change_5y"] = None
+    df["ocf_positive_years_5y"] = None
+    df["total_score"] = None
+    df["coverage_ratio"] = None
+    df["conclusion"] = "观察"
+
+    df["investigation_flag"] = 0
+    df["penalty_flag"] = 0
+    df["fund_occupation_flag"] = 0
+    df["illegal_reduce_flag"] = 0
+    df["pledge_ratio"] = None
+    df["no_dividend_5y_flag"] = 0
+    df["audit_change_count"] = 0
+    df["audit_opinion"] = "标准无保留意见"
+
+    df["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df["source_note"] = f"ak.spot_{mkt.lower()} + fundamental_enrich"
+    return df
+
+
+def _fetch_hk_spot_ak() -> pd.DataFrame:
+    # 港股口径固定为“主板+GEM公司”，直连失败时由上层走快照回退，不降级为全证券口径。
+    return _fetch_hk_spot_em_direct()
+
+
+def _fetch_hk_spot_em_direct() -> pd.DataFrame:
+    """
+    港股东方财富直连（禁用系统代理），优先获取市值等字段，避免 AKShare 精简字段导致大量空值。
+    """
+    hosts = [
+        "https://72.push2.eastmoney.com/api/qt/clist/get",
+        "https://81.push2.eastmoney.com/api/qt/clist/get",
+        "https://push2.eastmoney.com/api/qt/clist/get",
+    ]
+    base_params = {
+        "pn": "1",
+        "pz": "200",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f12",
+        # 主板 + GEM（上市公司口径），不混入其他证券类型
+        "fs": "m:128 t:3,m:128 t:4",
+        "fields": ",".join(
+            [
+                "f2",   # 最新价
+                "f3",   # 涨跌幅
+                "f6",   # 成交额
+                "f8",   # 换手率
+                "f9",   # 市盈率-动态
+                "f10",  # 量比
+                "f12",  # 代码
+                "f14",  # 名称
+                "f20",  # 总市值
+                "f21",  # 流通市值
+                "f23",  # 市净率
+                "f100", # 行业
+                "f127", # 行业(备用)
+            ]
+        ),
+    }
+
+    last_exc: Optional[Exception] = None
+    for url in hosts:
+        for _ in range(2):
+            try:
+                rows: List[Dict[str, Any]] = []
+                seen_codes: set[str] = set()
+                total_hint: Optional[int] = None
+                ses = requests.Session()
+                ses.trust_env = False
+
+                for page in range(1, 120):
+                    params = dict(base_params)
+                    params["pn"] = str(page)
+                    resp = ses.get(url, params=params, timeout=18, headers={"User-Agent": "Mozilla/5.0"})
+                    resp.raise_for_status()
+                    obj = resp.json()
+                    data_obj = (obj or {}).get("data") or {}
+                    if total_hint is None:
+                        try:
+                            total_hint = int(_to_float(data_obj.get("total")) or 0)
+                        except Exception:
+                            total_hint = None
+                    diff = data_obj.get("diff") or []
+                    if not diff:
+                        break
+
+                    page_new = 0
+                    for it in diff:
+                        raw = it or {}
+                        code = str(raw.get("f12", "")).strip()
+                        if (not code) or (code in seen_codes):
+                            continue
+                        seen_codes.add(code)
+                        page_new += 1
+                        industry = _safe_str(raw.get("f100")) or _safe_str(raw.get("f127"))
+                        rows.append(
+                            {
+                                "代码": code,
+                                "名称": str(raw.get("f14", "")).strip(),
+                                "所处行业": industry,
+                                "最新价": _to_float(raw.get("f2")),
+                                "涨跌幅": _to_float(raw.get("f3")),
+                                "成交额": _to_float(raw.get("f6")),
+                                "市盈率-动态": _to_float(raw.get("f9")),
+                                "市净率": _to_float(raw.get("f23")),
+                                "股息率": None,
+                                "总市值": _to_float(raw.get("f20")),
+                                "流通市值": _to_float(raw.get("f21")),
+                                "换手率": _to_float(raw.get("f8")),
+                                "量比": _to_float(raw.get("f10")),
+                            }
+                        )
+                    if page_new == 0:
+                        break
+                    if total_hint and len(rows) >= total_hint:
+                        break
+
+                out = pd.DataFrame(rows)
+                if out.empty:
+                    raise RuntimeError("港股直连结果为空")
+                return out
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.8)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("港股直连失败")
+
+
+def _build_base_universe(market_scope: str = "A") -> pd.DataFrame:
+    scope = _safe_str(market_scope).upper() or "A"
+    use_a = scope in {"A", "AH", "ALL"}
+    use_hk = scope in {"HK", "AH", "ALL"}
+    frames: List[pd.DataFrame] = []
+    errors: List[str] = []
+
+    if use_a:
+        try:
+            # 优先走直连端点，速度更稳定，也避免 AKShare 分页进度阻塞。
+            spot_a = _fetch_a_spot_em_direct()
+        except Exception:
+            spot_a = _ak_call_with_proxy_fallback(ak.stock_zh_a_spot_em)
+        if spot_a is None or spot_a.empty:
+            errors.append("A股快照为空")
+        else:
+            frames.append(_build_universe_from_spot(spot_a, market="A"))
+
+    if use_hk:
+        try:
+            spot_hk = _fetch_hk_spot_ak()
+            if spot_hk is None or spot_hk.empty:
+                errors.append("港股快照为空")
+            else:
+                frames.append(_build_universe_from_spot(spot_hk, market="HK"))
+        except Exception as exc:
+            errors.append(f"港股拉取失败: {exc}")
+
+    if not frames:
+        err = "；".join(errors) if errors else "未获取到市场快照"
+        raise RuntimeError(err)
+
+    out = pd.concat(frames, ignore_index=True)
+    return out
+
+
+def _build_base_universe_legacy() -> pd.DataFrame:
     try:
         spot_df = _ak_call_with_proxy_fallback(ak.stock_zh_a_spot_em)
     except Exception:
@@ -537,9 +856,9 @@ def _fetch_a_spot_em_direct() -> pd.DataFrame:
         "https://push2.eastmoney.com/api/qt/clist/get",
         "https://71.push2.eastmoney.com/api/qt/clist/get",
     ]
-    params = {
+    base_params = {
         "pn": "1",
-        "pz": "5000",
+        "pz": "200",
         "po": "1",
         "np": "1",
         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -570,34 +889,59 @@ def _fetch_a_spot_em_direct() -> pd.DataFrame:
     for url in hosts:
         for _ in range(2):
             try:
+                rows: List[Dict[str, Any]] = []
+                seen_codes: set[str] = set()
+                total_hint: Optional[int] = None
                 ses = requests.Session()
                 ses.trust_env = False
-                resp = ses.get(url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-                resp.raise_for_status()
-                obj = resp.json()
-                diff = (((obj or {}).get("data") or {}).get("diff") or [])
-                if not diff:
-                    raise RuntimeError("东方财富直连返回空数据")
 
-                rows: List[Dict[str, Any]] = []
-                for it in diff:
-                    rows.append(
-                        {
-                            "代码": str((it or {}).get("f12", "")).strip(),
-                            "名称": str((it or {}).get("f14", "")).strip(),
-                            "所处行业": str((it or {}).get("f100", "")).strip(),
-                            "最新价": _to_float((it or {}).get("f2")),
-                            "涨跌幅": _to_float((it or {}).get("f3")),
-                            "成交额": _to_float((it or {}).get("f6")),
-                            "市盈率-动态": _to_float((it or {}).get("f9")),
-                            "市净率": _to_float((it or {}).get("f23")),
-                            "股息率": None,
-                            "总市值": _to_float((it or {}).get("f20")),
-                            "流通市值": _to_float((it or {}).get("f21")),
-                            "换手率": _to_float((it or {}).get("f8")),
-                            "量比": _to_float((it or {}).get("f10")),
-                        }
-                    )
+                for page in range(1, 120):
+                    params = dict(base_params)
+                    params["pn"] = str(page)
+                    resp = ses.get(url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                    resp.raise_for_status()
+                    obj = resp.json()
+                    data_obj = (obj or {}).get("data") or {}
+                    if total_hint is None:
+                        try:
+                            total_hint = int(_to_float(data_obj.get("total")) or 0)
+                        except Exception:
+                            total_hint = None
+                    diff = data_obj.get("diff") or []
+                    if not diff:
+                        break
+
+                    page_new = 0
+                    for it in diff:
+                        raw = it or {}
+                        code = str(raw.get("f12", "")).strip()
+                        if (not code) or (code in seen_codes):
+                            continue
+                        seen_codes.add(code)
+                        page_new += 1
+                        rows.append(
+                            {
+                                "代码": code,
+                                "名称": str(raw.get("f14", "")).strip(),
+                                "所处行业": str(raw.get("f100", "")).strip(),
+                                "最新价": _to_float(raw.get("f2")),
+                                "涨跌幅": _to_float(raw.get("f3")),
+                                "成交额": _to_float(raw.get("f6")),
+                                "市盈率-动态": _to_float(raw.get("f9")),
+                                "市净率": _to_float(raw.get("f23")),
+                                "股息率": None,
+                                "总市值": _to_float(raw.get("f20")),
+                                "流通市值": _to_float(raw.get("f21")),
+                                "换手率": _to_float(raw.get("f8")),
+                                "量比": _to_float(raw.get("f10")),
+                            }
+                        )
+                    if page_new == 0:
+                        break
+                    if total_hint and len(rows) >= total_hint:
+                        break
+                if not rows:
+                    raise RuntimeError("东方财富直连返回空数据")
                 return pd.DataFrame(rows)
             except Exception as exc:
                 last_exc = exc
@@ -608,15 +952,106 @@ def _fetch_a_spot_em_direct() -> pd.DataFrame:
     raise RuntimeError("东方财富直连失败")
 
 
+def _normalize_dt_text(v: Any) -> str:
+    text = _safe_str(v)
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return text
+
+
+def _log_snapshot_run(
+    row_count: int,
+    enriched_count: int,
+    enrich_start: int,
+    enrich_end: int,
+    fallback: bool,
+    error_brief: str,
+    cache_hit: int,
+    cache_miss: int,
+    enrich_mode: str,
+) -> None:
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO snapshot_runs(
+                run_at, row_count, enriched_count, enrich_start, enrich_end,
+                fallback, error_brief, cache_hit, cache_miss, enrich_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                int(row_count),
+                int(enriched_count),
+                int(enrich_start),
+                int(enrich_end),
+                1 if fallback else 0,
+                _safe_str(error_brief)[:360],
+                int(cache_hit),
+                int(cache_miss),
+                _safe_str(enrich_mode) or "top",
+            ),
+        )
+        conn.commit()
+
+
+def _classify_error_type(text: Any) -> str:
+    t = _safe_str(text).lower()
+    if not t:
+        return "none"
+    if "name resolution" in t or "failed to resolve" in t or "nodename nor servname" in t:
+        return "dns"
+    if "proxy" in t:
+        return "proxy"
+    if "timeout" in t:
+        return "timeout"
+    if "ssl" in t:
+        return "ssl"
+    if "connection" in t or "connect" in t:
+        return "connection"
+    if "rate" in t or "429" in t or "too many requests" in t:
+        return "rate_limit"
+    return "other"
+
+
 def refresh_market_snapshot(
     max_stocks: int = 0,
     enrich_top_n: int = 300,
     force_refresh: bool = False,
     rotate_enrich: bool = True,
+    market_scope: str = "A",
+    weekly_mode: bool = False,
+    safe_mode: bool = True,
 ) -> Dict[str, Any]:
     init_db()
+    scope = _safe_str(market_scope).upper() or "A"
+    meta0 = get_snapshot_meta()
+    if weekly_mode:
+        last_weekly = _safe_str(meta0.get(f"last_weekly_update_{scope}", ""))
+        if last_weekly:
+            try:
+                last_dt = datetime.fromisoformat(last_weekly)
+            except Exception:
+                try:
+                    last_dt = datetime.strptime(last_weekly, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    last_dt = None
+            if last_dt is not None:
+                delta_days = (datetime.now() - last_dt).total_seconds() / 86400.0
+                if delta_days < 7:
+                    return {
+                        "skipped": True,
+                        "reason": f"周更间隔未满7天（已过 {delta_days:.1f} 天）",
+                        "row_count": int(_to_float(meta0.get("row_count")) or 0),
+                        "enriched_count": 0,
+                        "market_scope": scope,
+                    }
+    enrich_mode = "rotate" if rotate_enrich else "top"
     try:
-        df = _build_base_universe().copy()
+        df = _build_base_universe(market_scope=scope).copy()
     except Exception as exc:
         # 网络/代理异常时兜底：如果本地已有快照，不让更新动作直接失败
         existed = load_snapshot()
@@ -625,20 +1060,37 @@ def refresh_market_snapshot(
             _snapshot_meta_set("last_refresh_error", str(exc))
             _snapshot_meta_set("last_refresh_error_at", now_text)
             _snapshot_meta_set("last_refresh_fallback", "1")
+            _log_snapshot_run(
+                row_count=int(len(existed)),
+                enriched_count=0,
+                enrich_start=0,
+                enrich_end=0,
+                fallback=True,
+                error_brief=str(exc),
+                cache_hit=0,
+                cache_miss=0,
+                enrich_mode=enrich_mode,
+            )
             return {
                 "row_count": int(len(existed)),
                 "enriched_count": 0,
                 "updated_at": now_text,
                 "fallback": True,
                 "error": str(exc),
-                "enrich_mode": "rotate" if rotate_enrich else "top",
+                "enrich_mode": enrich_mode,
                 "enrich_start": 0,
                 "enrich_end": 0,
             }
         raise RuntimeError(
             f"未能拉取市场快照（可能是代理/VPN导致连接被拒绝）：{exc}"
         ) from exc
-    df = df[df["code"].str.fullmatch(r"\d{6}", na=False)].copy()
+    if "market" not in df.columns:
+        df["market"] = "A"
+    df["market"] = df["market"].astype(str).str.upper()
+    df = df[
+        ((df["market"] == "A") & df["code"].astype(str).str.fullmatch(r"\d{6}", na=False))
+        | ((df["market"] == "HK") & df["code"].astype(str).str.fullmatch(r"\d{5}", na=False))
+    ].copy()
     df = df.sort_values(by=["total_mv", "code"], ascending=[False, True], na_position="last").reset_index(drop=True)
 
     if max_stocks and max_stocks > 0:
@@ -650,32 +1102,53 @@ def refresh_market_snapshot(
     total_count = len(df)
     start_idx = 0
     target_indices: List[int] = []
+    cache_hit = 0
+    cache_miss = 0
 
-    if enrich_n > 0 and total_count > 0:
+    # 基本面深补目前仅对A股执行，港股先走行情快照，避免接口无效调用与过度请求
+    eligible_indices = [int(i) for i, m in enumerate(df["market"].tolist()) if _safe_str(m).upper() == "A"]
+    eligible_total = len(eligible_indices)
+    enrich_n = max(0, min(enrich_n, eligible_total))
+    cursor_key = f"enrich_cursor_index_{scope}"
+
+    if enrich_n > 0 and eligible_total > 0:
         if rotate_enrich:
             meta = get_snapshot_meta()
             try:
-                start_idx = int(meta.get("enrich_cursor_index", "0"))
+                start_idx = int(meta.get(cursor_key, meta.get("enrich_cursor_index", "0")))
             except Exception:
                 start_idx = 0
-            start_idx = start_idx % total_count
-            target_indices = [int((start_idx + step) % total_count) for step in range(enrich_n)]
+            start_idx = start_idx % eligible_total
+            target_indices = [eligible_indices[int((start_idx + step) % eligible_total)] for step in range(enrich_n)]
         else:
-            target_indices = list(range(enrich_n))
+            target_indices = eligible_indices[:enrich_n]
 
+    df["enriched_at"] = None
+    consecutive_fail = 0
     for idx in target_indices:
         code = str(df.at[idx, "code"])
         name = str(df.at[idx, "name"])
         try:
-            ext = _enrich_one(code, name, force_refresh=force_refresh)
+            ext, source, cached_at = _enrich_one(code, name, force_refresh=force_refresh)
             for k, v in ext.items():
                 if k in df.columns and v is not None:
                     df.at[idx, k] = v
+            df.at[idx, "enriched_at"] = _normalize_dt_text(cached_at) or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if source == "cache":
+                cache_hit += 1
+            else:
+                cache_miss += 1
+            consecutive_fail = 0
         except Exception:
-            pass
+            consecutive_fail += 1
 
+        # 防封节流：随机抖动 + 连续失败熔断
+        if safe_mode:
+            time.sleep(random.uniform(0.25, 0.65))
+            if consecutive_fail >= 15:
+                break
         if idx > 0 and idx % 40 == 0:
-            time.sleep(0.05)
+            time.sleep(0.2 if safe_mode else 0.05)
 
     for i in range(len(df)):
         code = str(df.at[i, "code"])
@@ -718,6 +1191,7 @@ def refresh_market_snapshot(
     df["data_quality"] = df.apply(_quality, axis=1)
 
     cols = [
+        "market",
         "code",
         "name",
         "industry",
@@ -767,6 +1241,7 @@ def refresh_market_snapshot(
         "conclusion",
         "coverage_ratio",
         "data_quality",
+        "enriched_at",
         "updated_at",
         "source_note",
     ]
@@ -783,16 +1258,38 @@ def refresh_market_snapshot(
     _snapshot_meta_set("last_refresh_fallback", "0")
     _snapshot_meta_set("last_refresh_error", "")
     _snapshot_meta_set("last_refresh_error_at", "")
-    if rotate_enrich and enrich_n > 0 and total_count > 0:
-        _snapshot_meta_set("enrich_cursor_index", str((start_idx + enrich_n) % total_count))
+    _snapshot_meta_set("last_scope", scope)
+    if rotate_enrich and enrich_n > 0 and eligible_total > 0:
+        _snapshot_meta_set(cursor_key, str((start_idx + enrich_n) % eligible_total))
+        _snapshot_meta_set("enrich_cursor_index", str((start_idx + enrich_n) % eligible_total))
+    if weekly_mode:
+        _snapshot_meta_set(f"last_weekly_update_{scope}", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    enrich_start = int(start_idx + 1) if enrich_n > 0 else 0
+    enrich_end = int(((start_idx + enrich_n - 1) % eligible_total) + 1) if enrich_n > 0 and eligible_total > 0 else 0
+    _log_snapshot_run(
+        row_count=len(save_df),
+        enriched_count=enrich_n,
+        enrich_start=enrich_start,
+        enrich_end=enrich_end,
+        fallback=False,
+        error_brief="",
+        cache_hit=cache_hit,
+        cache_miss=cache_miss,
+        enrich_mode=enrich_mode,
+    )
 
     return {
         "row_count": len(save_df),
         "enriched_count": enrich_n,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "enrich_mode": "rotate" if rotate_enrich else "top",
-        "enrich_start": int(start_idx + 1) if enrich_n > 0 else 0,
-        "enrich_end": int(((start_idx + enrich_n - 1) % total_count) + 1) if enrich_n > 0 and total_count > 0 else 0,
+        "enrich_mode": enrich_mode,
+        "enrich_start": enrich_start,
+        "enrich_end": enrich_end,
+        "cache_hit": cache_hit,
+        "cache_miss": cache_miss,
+        "market_scope": scope,
+        "weekly_mode": bool(weekly_mode),
     }
 
 
@@ -804,6 +1301,224 @@ def load_snapshot() -> pd.DataFrame:
         except Exception:
             return pd.DataFrame()
     return df
+
+
+def get_snapshot_health_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
+    init_db()
+    meta = get_snapshot_meta()
+    df = load_snapshot()
+
+    total = int(len(df))
+    quality_counts = {"full": 0, "partial": 0, "missing": 0}
+    if total > 0 and "data_quality" in df.columns:
+        vc = df["data_quality"].value_counts(dropna=False).to_dict()
+        quality_counts = {
+            "full": int(vc.get("full", 0)),
+            "partial": int(vc.get("partial", 0)),
+            "missing": int(vc.get("missing", 0)),
+        }
+    covered = int(quality_counts["full"] + quality_counts["partial"])
+    coverage_ratio = (covered / total) if total > 0 else 0.0
+
+    now = datetime.now()
+    freshness = {
+        "0_1d": 0,
+        "1_3d": 0,
+        "3_7d": 0,
+        "7d_plus": 0,
+        "never": 0,
+    }
+
+    enriched_series = df["enriched_at"] if ("enriched_at" in df.columns) else pd.Series([None] * total, index=df.index)
+    parsed_dt: List[Optional[datetime]] = []
+    for v in enriched_series:
+        text = _safe_str(v)
+        if not text:
+            parsed_dt.append(None)
+            freshness["never"] += 1
+            continue
+        dt_val: Optional[datetime] = None
+        try:
+            dt_val = datetime.fromisoformat(text)
+        except Exception:
+            try:
+                dt_val = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                dt_val = None
+        parsed_dt.append(dt_val)
+        if dt_val is None:
+            freshness["never"] += 1
+            continue
+        delta_days = (now - dt_val).total_seconds() / 86400.0
+        if delta_days < 1:
+            freshness["0_1d"] += 1
+        elif delta_days < 3:
+            freshness["1_3d"] += 1
+        elif delta_days < 7:
+            freshness["3_7d"] += 1
+        else:
+            freshness["7d_plus"] += 1
+
+    key_cols = [
+        "pe_ttm",
+        "pb",
+        "dividend_yield",
+        "roe",
+        "gross_margin",
+        "net_margin",
+        "asset_liability_ratio",
+        "operating_cashflow_3y",
+    ]
+    available_key_cols = [c for c in key_cols if c in df.columns]
+    if available_key_cols:
+        missing_count_series = df[available_key_cols].isna().sum(axis=1)
+    else:
+        missing_count_series = pd.Series([0] * total, index=df.index)
+
+    enrich_df = pd.DataFrame(
+        {
+            "code": df.get("code", pd.Series([], dtype=object)),
+            "name": df.get("name", pd.Series([], dtype=object)),
+            "enriched_at": [_normalize_dt_text(v.isoformat() if isinstance(v, datetime) else (v if v is not None else "")) for v in parsed_dt],
+            "missing_fields_count": missing_count_series,
+        }
+    )
+
+    oldest_df = enrich_df.copy()
+    oldest_df["sort_dt"] = parsed_dt
+    oldest_df = oldest_df[oldest_df["sort_dt"].notna()].sort_values(by=["sort_dt", "missing_fields_count"], ascending=[True, False]).head(int(top_n))
+    oldest_df = oldest_df.drop(columns=["sort_dt"]).reset_index(drop=True)
+
+    newest_df = enrich_df.copy()
+    newest_df["sort_dt"] = parsed_dt
+    newest_df = newest_df[newest_df["sort_dt"].notna()].sort_values(by=["sort_dt", "missing_fields_count"], ascending=[False, True]).head(int(top_n))
+    newest_df = newest_df.drop(columns=["sort_dt"]).reset_index(drop=True)
+
+    missing_rank = []
+    for col in available_key_cols:
+        missing_rank.append({"field": col, "missing_count": int(df[col].isna().sum())})
+    missing_rank = sorted(missing_rank, key=lambda x: x["missing_count"], reverse=True)
+
+    with _connect() as conn:
+        trend_df = pd.read_sql_query(
+            """
+            SELECT substr(run_at, 1, 10) AS run_date,
+                   SUM(enriched_count) AS enriched_total,
+                   SUM(CASE WHEN fallback=1 THEN 1 ELSE 0 END) AS fallback_count,
+                   COUNT(*) AS run_count
+            FROM snapshot_runs
+            WHERE run_at >= datetime('now', ?)
+            GROUP BY substr(run_at, 1, 10)
+            ORDER BY run_date ASC
+            """,
+            conn,
+            params=(f"-{int(days)} days",),
+        )
+        latest_run_df = pd.read_sql_query(
+            "SELECT * FROM snapshot_runs ORDER BY run_id DESC LIMIT 1",
+            conn,
+        )
+        fail_df = pd.read_sql_query(
+            """
+            SELECT run_at, fallback, error_brief, enrich_mode
+            FROM snapshot_runs
+            WHERE fallback=1 OR length(trim(coalesce(error_brief, ''))) > 0
+            ORDER BY run_id DESC
+            LIMIT 5
+            """,
+            conn,
+        )
+        runs_df = pd.read_sql_query(
+            """
+            SELECT run_at, row_count, enriched_count, enrich_start, enrich_end,
+                   fallback, cache_hit, cache_miss, enrich_mode, error_brief
+            FROM snapshot_runs
+            ORDER BY run_id DESC
+            LIMIT 50
+            """,
+            conn,
+        )
+
+    latest_run = latest_run_df.iloc[0].to_dict() if not latest_run_df.empty else {}
+    cache_hit = int(latest_run.get("cache_hit", 0) or 0)
+    cache_miss = int(latest_run.get("cache_miss", 0) or 0)
+
+    fail_type_df = pd.DataFrame(columns=["error_type", "count"])
+    if isinstance(runs_df, pd.DataFrame) and (not runs_df.empty):
+        tmp = runs_df.copy()
+        tmp["error_type"] = tmp["error_brief"].map(_classify_error_type)
+        tmp = tmp[tmp["error_type"] != "none"]
+        if not tmp.empty:
+            fail_type_df = (
+                tmp.groupby("error_type", as_index=False)
+                .size()
+                .rename(columns={"size": "count"})
+                .sort_values(by="count", ascending=False)
+                .reset_index(drop=True)
+            )
+
+    last_scope = _safe_str(meta.get("last_scope", "A")) or "A"
+    cursor_idx = int(_to_float(meta.get(f"enrich_cursor_index_{last_scope}", meta.get("enrich_cursor_index"))) or 0)
+    cursor_pos = (cursor_idx + 1) if total > 0 else 0
+
+    return {
+        "meta": meta,
+        "last_scope": last_scope,
+        "total": total,
+        "quality_counts": quality_counts,
+        "covered": covered,
+        "coverage_ratio": coverage_ratio,
+        "freshness": freshness,
+        "oldest_df": oldest_df,
+        "newest_df": newest_df,
+        "missing_rank": missing_rank,
+        "trend_df": trend_df,
+        "fail_df": fail_df,
+        "fail_type_df": fail_type_df,
+        "runs_df": runs_df,
+        "latest_run": latest_run,
+        "cache_hit": cache_hit,
+        "cache_miss": cache_miss,
+        "cursor_pos": cursor_pos,
+    }
+
+
+def export_snapshot_health_excel(days: int = 30, top_n: int = 50) -> bytes:
+    report = get_snapshot_health_report(days=days, top_n=top_n)
+    meta = report.get("meta", {}) if isinstance(report, dict) else {}
+    total = int(report.get("total", 0) or 0)
+    qc = report.get("quality_counts", {}) if isinstance(report, dict) else {}
+    fresh = report.get("freshness", {}) if isinstance(report, dict) else {}
+
+    summary_df = pd.DataFrame(
+        [
+            {"item": "last_update", "value": _safe_str(meta.get("last_update", ""))},
+            {"item": "last_refresh_fallback", "value": _safe_str(meta.get("last_refresh_fallback", ""))},
+            {"item": "last_refresh_error_at", "value": _safe_str(meta.get("last_refresh_error_at", ""))},
+            {"item": "enrich_cursor_index", "value": _safe_str(meta.get("enrich_cursor_index", ""))},
+            {"item": "row_count", "value": str(total)},
+            {"item": "quality_full", "value": str(int(qc.get("full", 0) or 0))},
+            {"item": "quality_partial", "value": str(int(qc.get("partial", 0) or 0))},
+            {"item": "quality_missing", "value": str(int(qc.get("missing", 0) or 0))},
+            {"item": "fresh_0_1d", "value": str(int(fresh.get("0_1d", 0) or 0))},
+            {"item": "fresh_1_3d", "value": str(int(fresh.get("1_3d", 0) or 0))},
+            {"item": "fresh_3_7d", "value": str(int(fresh.get("3_7d", 0) or 0))},
+            {"item": "fresh_7d_plus", "value": str(int(fresh.get("7d_plus", 0) or 0))},
+            {"item": "fresh_never", "value": str(int(fresh.get("never", 0) or 0))},
+        ]
+    )
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="summary")
+        pd.DataFrame(report.get("trend_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="trend_7d")
+        pd.DataFrame(report.get("runs_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="runs_latest50")
+        pd.DataFrame(report.get("fail_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="fails_latest5")
+        pd.DataFrame(report.get("fail_type_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="fail_types")
+        pd.DataFrame(report.get("missing_rank", [])).to_excel(writer, index=False, sheet_name="missing_rank")
+        pd.DataFrame(report.get("oldest_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="oldest_enriched")
+        pd.DataFrame(report.get("newest_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="newest_enriched")
+    return output.getvalue()
 
 
 def _num(v: Any) -> Optional[float]:
@@ -869,6 +1584,27 @@ def _split_keywords(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def _expand_industry_keywords(kws: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(v: str) -> None:
+        key = _safe_str(v).lower()
+        if not key:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(v)
+
+    for one in kws:
+        raw = _safe_str(one)
+        _add(raw)
+        for alias in INDUSTRY_KEYWORD_ALIAS_MAP.get(raw.lower(), []):
+            _add(alias)
+    return out
+
+
 def apply_filters(df: pd.DataFrame, config: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     if df is None or df.empty:
         empty = pd.DataFrame(columns=DISPLAY_COLUMNS)
@@ -886,6 +1622,18 @@ def apply_filters(df: pd.DataFrame, config: Dict[str, Any]) -> Tuple[pd.DataFram
     for _, row in df.iterrows():
         reasons: List[str] = []
         missing: List[str] = []
+
+        scope = _safe_str(r.get("market_scope", "all")).upper()
+        row_market = _safe_str(row.get("market")).upper() or "A"
+        if scope in {"A", "HK"} and row_market != scope:
+            reasons.append(f"市场不匹配({scope})")
+
+        if bool(r.get("industry_include_enabled", False)):
+            kws = _expand_industry_keywords(_split_keywords(r.get("industry_include_keywords", "")))
+            if kws:
+                search_text = f"{_safe_str(row.get('industry'))} {_safe_str(row.get('name'))}".lower()
+                if not any(k.lower() in search_text for k in kws):
+                    reasons.append("行业不匹配")
 
         is_st = int(_num(row.get("is_st")) or 0)
         if r.get("exclude_st", True) and is_st == 1:
@@ -1167,6 +1915,7 @@ def apply_filters(df: pd.DataFrame, config: Dict[str, Any]) -> Tuple[pd.DataFram
         )
 
         out = {
+            "market": _safe_str(row.get("market")) or "A",
             "code": _safe_str(row.get("code")),
             "name": _safe_str(row.get("name")),
             "industry": _safe_str(row.get("industry")),
