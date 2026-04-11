@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time as pytime
 from datetime import datetime, time
@@ -94,12 +95,17 @@ from shared.ui_shell import render_app_shell, render_section_intro, render_statu
 
 st.set_page_config(page_title="Quant Dashboard", page_icon="📊", layout="wide")
 APP_VERSION = "QDB-20260327-FLT5Y-01"
+BACKTEST_APP_VERSION = "BT-20260411-01"
 LOCAL_PREFS_PATH = "data/local_user_prefs.json"
 ANALYSIS_CACHE_PATH = "data/deepseek_analysis_cache.json"
 ANALYSIS_JOB_DIR = "data/analysis_jobs"
 ANALYSIS_DELTA_CACHE_PATH = "data/deepseek_delta_cache.json"
 ANALYSIS_COOLDOWN_PATH = "data/deepseek_cooldown.json"
 DEEP_COOLDOWN_MINUTES = 5
+BACKTEST_DIR = CURRENT_DIR.parent / "backtest"
+BACKTEST_RUNNER = BACKTEST_DIR / "run_backtest.py"
+BACKTEST_STRATEGY_DIR = BACKTEST_DIR / "config" / "strategies"
+BACKTEST_REPORT_DIR = BACKTEST_DIR / "reports"
 DEEPSEEK_SYSTEM_PROMPT = """你是一个专业的股票分析师。必须严格按照【五维分析框架】分析：
 
 【五维分析框架】
@@ -708,11 +714,13 @@ render_app_shell(
         "fundamental": FUND_APP_VERSION,
         "trading": APP_VERSION,
         "filter": FILTER_APP_VERSION,
+        "backtest": BACKTEST_APP_VERSION,
     }.get(_active_page, APP_VERSION),
     badges={
         "fundamental": ("八维评分", "观察名单", "结构化结论"),
         "trading": ("实时盘口", "分时结构", "DeepSeek 分析"),
         "filter": ("两段筛选", "快照更新", "结果导出"),
+        "backtest": ("多空回测", "成本建模", "HTML报告"),
     }.get(_active_page, ("实时盘口", "分时结构", "DeepSeek 分析")),
     metrics={
         "fundamental": (
@@ -729,6 +737,11 @@ render_app_shell(
             ("股票池联动", f"{len(pool_rows_for_sidebar)} 只"),
             ("筛选方式", "两段排雷"),
             ("工作流", "快照 -> 条件 -> 导出"),
+        ),
+        "backtest": (
+            ("策略配置", "YAML可编辑"),
+            ("回测区间", "2021-01-01 -> today"),
+            ("工作流", "更新数据 -> 执行 -> 复盘"),
         ),
     }.get(
         _active_page,
@@ -1989,6 +2002,128 @@ def _render_filter_page():
         st.dataframe(show3, use_container_width=True, hide_index=True)
 
 
+def _render_backtest_page():
+    render_section_intro(
+        "回测系统",
+        "这是 Quant 的第4个功能：通用港股多空对冲回测。支持策略配置、数据更新、回测执行与HTML报告产出。",
+        kicker="Backtest",
+        pills=("Universe管理", "策略配置", "一键回测", "交互报告"),
+    )
+
+    if "bt_console_output" not in st.session_state:
+        st.session_state["bt_console_output"] = ""
+
+    if not BACKTEST_RUNNER.exists():
+        st.error(f"未找到回测入口: {BACKTEST_RUNNER}")
+        return
+
+    strategy_files = sorted(BACKTEST_STRATEGY_DIR.glob("*.yaml"))
+    if not strategy_files:
+        st.error(f"未找到策略配置文件目录: {BACKTEST_STRATEGY_DIR}")
+        return
+
+    default_idx = 0
+    for i, p in enumerate(strategy_files):
+        if p.name == "realestate_example.yaml":
+            default_idx = i
+            break
+    selected_cfg = st.selectbox(
+        "策略配置文件",
+        options=[p.name for p in strategy_files],
+        index=default_idx,
+        key="bt_selected_strategy",
+    )
+
+    def _run_cmd(cmd: list[str], label: str) -> None:
+        with st.spinner(f"{label} 执行中..."):
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(BACKTEST_DIR),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1800,
+                )
+                output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+                st.session_state["bt_console_output"] = output.strip()
+                if proc.returncode == 0:
+                    st.success(f"{label} 完成")
+                else:
+                    st.error(f"{label} 失败（exit={proc.returncode}）")
+            except Exception as exc:
+                st.error(f"{label} 异常: {exc}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button("安装回测依赖", use_container_width=True, key="bt_install_deps"):
+        _run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], "安装依赖")
+    if c2.button("校验Universe", use_container_width=True, key="bt_validate_universe"):
+        _run_cmd([sys.executable, "run_backtest.py", "--validate-universe"], "校验Universe")
+    if c3.button("更新缓存数据", use_container_width=True, key="bt_update_data"):
+        _run_cmd([sys.executable, "run_backtest.py", "--update-data-only", "--start", "2021-01-01", "--end", "today"], "更新缓存")
+    if c4.button("运行回测", type="primary", use_container_width=True, key="bt_run"):
+        _run_cmd(
+            [
+                sys.executable,
+                "run_backtest.py",
+                "--config",
+                f"config/strategies/{selected_cfg}",
+                "--output",
+                "reports",
+                "--no-browser",
+            ],
+            "运行回测",
+        )
+
+    render_status_row(
+        (
+            ("模块目录", str(BACKTEST_DIR)),
+            ("策略文件数", str(len(strategy_files))),
+            ("报告目录", str(BACKTEST_REPORT_DIR)),
+            ("Python", sys.executable),
+        )
+    )
+
+    console_output = st.session_state.get("bt_console_output", "")
+    if console_output:
+        st.caption("最近一次命令输出")
+        st.code(console_output, language="bash")
+
+    reports = sorted(BACKTEST_REPORT_DIR.glob("report_*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if reports:
+        latest = reports[0]
+        st.success(f"最新报告: {latest.name}")
+        st.download_button(
+            "下载最新报告HTML",
+            data=latest.read_bytes(),
+            file_name=latest.name,
+            mime="text/html",
+            use_container_width=True,
+            key="bt_download_latest",
+        )
+        if st.checkbox("页面内预览最新报告", value=False, key="bt_preview_latest"):
+            try:
+                html(latest.read_text(encoding="utf-8"), height=920, scrolling=True)
+            except Exception as exc:
+                st.warning(f"预览失败: {exc}")
+
+        with st.expander("查看报告列表", expanded=False):
+            rows = []
+            for p in reports[:30]:
+                stat = p.stat()
+                rows.append(
+                    {
+                        "文件名": p.name,
+                        "修改时间": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                        "大小(KB)": round(stat.st_size / 1024.0, 1),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("暂未找到回测报告，请先点击“运行回测”。")
+
+
 def _analysis_job_file(job_id: str) -> str:
     return os.path.join(ANALYSIS_JOB_DIR, f"{job_id}.json")
 
@@ -2370,6 +2505,9 @@ if st.session_state.get("active_page") == "fundamental":
     st.stop()
 if st.session_state.get("active_page") == "filter":
     _render_filter_page()
+    st.stop()
+if st.session_state.get("active_page") == "backtest":
+    _render_backtest_page()
     st.stop()
 
 

@@ -1,0 +1,9 @@
+# runtime cache
+__pycache__/
+*.pyc
+
+# downloaded data cache
+data/*.csv
+
+# generated reports
+reports/*.html

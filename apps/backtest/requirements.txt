@@ -1,0 +1,6 @@
+yfinance>=0.2.0
+akshare>=1.10.0
+pandas>=2.0
+numpy>=1.24
+plotly>=5.15
+pyyaml>=6.0

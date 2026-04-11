@@ -4,3 +4,6 @@ APScheduler>=3.10,<4.0
 requests>=2.31,<3.0
 pandas>=2.0,<3.0
 openai>=1.40,<2.0
+yfinance>=0.2,<2.0
+plotly>=5.15,<7.0
+pyyaml>=6.0,<7.0

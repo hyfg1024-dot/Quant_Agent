@@ -4,13 +4,14 @@
 
 ## 项目概览
 
-当前版本包含 3 个核心模块：
+当前版本包含 4 个核心模块：
 
 | 模块 | 说明 | 入口 |
 | --- | --- | --- |
 | Trading | 交易观察台，聚合行情快照、盘口、分时结构与 DeepSeek 深析流程 | `apps/trading/app.py` |
 | Fundamental | 基本面研究台，提供八维评分、总结文本与 DeepSeek 辅助解读 | `apps/fundamental/app.py` |
 | Filter | 全市场条件筛选器，支持模板化筛选、AI 辅助设定和 Excel 导出 | `apps/filter/app.py` |
+| Backtest | 通用港股多空回测台，支持策略配置、数据更新、执行回测与HTML报告 | `apps/backtest/run_backtest.py` |
 
 ## 主要能力
 
@@ -19,6 +20,7 @@
 - 基本面八维评分与结构化总结
 - DeepSeek 分析接入，支持本地保存用户配置
 - 全市场筛选、模板保存、结果分池与 Excel 导出
+- 通用多空策略回测与交互式报告输出
 - macOS 一键启动脚本与桌面快捷入口
 
 ## 目录结构
@@ -28,7 +30,8 @@ Quant_System/
 ├── apps/
 │   ├── trading/          # 交易观察模块
 │   ├── fundamental/      # 基本面研究模块
-│   └── filter/           # 条件筛选模块
+│   ├── filter/           # 条件筛选模块
+│   └── backtest/         # 回测模块
 ├── shared/               # 共享 UI / 通用逻辑
 ├── data/                 # 本地数据、缓存、用户配置
 ├── docs/                 # 附加文档

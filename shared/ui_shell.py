@@ -63,9 +63,23 @@ _SHELLS: dict[str, ShellMeta] = {
             ("工作方式", "围绕持仓/观察池"),
         ),
     ),
+    "backtest": ShellMeta(
+        label="Backtest Lab",
+        nav_title="回测系统",
+        title="策略回测台",
+        subtitle="配置标的池、仓位和成本参数，执行港股多空历史回测并生成交互式诊断报告。",
+        accent="#8bb37a",
+        accent_soft="#d8e8ce",
+        glow="rgba(139, 179, 122, 0.24)",
+        metrics=(
+            ("主视角", "策略验证"),
+            ("信息层级", "配置 + 回测 + 报告"),
+            ("工作方式", "参数迭代与复盘"),
+        ),
+    ),
 }
 
-_NAV_ORDER = ("filter", "fundamental", "trading")
+_NAV_ORDER = ("filter", "fundamental", "trading", "backtest")
 
 
 def _shell_style(meta: ShellMeta, active_page: str) -> str:
@@ -456,6 +470,11 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
       background:
         linear-gradient(180deg, rgba(225, 193, 138, 0.98), rgba(195, 154, 93, 1)) !important;
       border-color: rgba(245, 221, 180, 0.76) !important;
+    }}
+    .st-key-qs_top_nav_backtest div.stButton > button {{
+      background:
+        linear-gradient(180deg, rgba(175, 201, 145, 0.98), rgba(137, 167, 108, 1)) !important;
+      border-color: rgba(221, 236, 201, 0.78) !important;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button:hover {{
       opacity: 1;
@@ -958,7 +977,7 @@ def render_top_nav(active_page: str) -> str:
     selected = active_page
     st.markdown("<div class='qs-top-nav-reserve'></div>", unsafe_allow_html=True)
     with st.container(key="qs_top_nav_row"):
-        cols = st.columns([1.05, 1.05, 1.05, 4.2], vertical_alignment="center")
+        cols = st.columns([1.02, 1.02, 1.02, 1.02, 3.2], vertical_alignment="center")
         for idx, key in enumerate(_NAV_ORDER):
             with cols[idx]:
                 marker_class = "qs-top-nav-marker is-active" if key == active_page else "qs-top-nav-marker"
