@@ -1,4 +1,4 @@
-"""Entry script for running configurable HK long-short backtests."""
+"""Entry script for configurable backtests using Backtrader execution layer."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="港股多空对冲回测系统")
+    parser = argparse.ArgumentParser(description="港股多空对冲回测系统（Backtrader）")
     parser.add_argument("--config", default="config/strategies/realestate_example.yaml", help="策略配置文件路径")
     parser.add_argument("--universe", default="config/universe.yaml", help="标的池配置文件路径")
     parser.add_argument("--output", default="reports", help="报告输出目录")
@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", default="today", help="validate/update 模式结束日期")
 
     parser.add_argument("--rf-rate", type=float, default=0.03, help="无风险利率，默认 3%%")
+    parser.add_argument("--volume-fill-pct", type=float, default=0.20, help="单日成交量可撮合比例，默认 20%%")
     parser.add_argument("--no-browser", action="store_true", help="生成报告后不自动打开浏览器")
     return parser.parse_args()
 
@@ -113,7 +114,7 @@ def print_summary(
     report_path: Path,
     costs: Dict[str, float],
 ) -> None:
-    print("\n=== 回测完成 ===")
+    print("\n=== 回测完成（Backtrader）===")
     print(f"策略: {cfg.strategy_name}")
     print(f"区间: {cfg.backtest.start_date} -> {cfg.backtest.end_date}")
 
@@ -134,7 +135,6 @@ def print_summary(
     print(f"  交易成本: {costs.get('commission_long', 0.0) + costs.get('commission_short', 0.0):,.2f} HKD")
     print(f"  融券费用: {costs.get('borrow_fee', 0.0):,.2f} HKD")
     print(f"  总成本:   {costs.get('total', 0.0):,.2f} HKD")
-
     print(f"报告: {report_path}")
 
 
@@ -147,10 +147,14 @@ def main() -> int:
         config_path = resolve_path(base_dir, args.config)
         output_dir = resolve_path(base_dir, args.output)
 
-        from src.backtest_engine import BacktestEngine
         from src.data_manager import DataManager
         from src.metrics import MetricsCalculator
         from src.visualizer import ReportVisualizer
+        from strategies.long_short_bt import (
+            parse_board_lot_overrides,
+            run_backtrader_backtest,
+            run_backtrader_sensitivity,
+        )
 
         universe = load_universe(universe_path)
         dm = DataManager(data_dir=base_dir / "data", logger=print)
@@ -160,7 +164,6 @@ def main() -> int:
 
         if args.validate_universe:
             return validate_universe(dm, universe, start=start, end=end, sector=args.sector)
-
         if args.update_data_only:
             update_data_cache(dm, universe, start=start, end=end, sector=args.sector)
             return 0
@@ -171,12 +174,12 @@ def main() -> int:
         sector_bmk = get_sector_benchmark(universe, cfg.sector)
         if sector_bmk and sector_bmk != "^HSI":
             try:
-                _check = dm.fetch_index_data(
+                bdf = dm.fetch_index_data(
                     sector_bmk,
                     start=str(cfg.backtest.start_date),
                     end=str(cfg.backtest.end_date),
                 )
-                if not _check.empty:
+                if not bdf.empty:
                     bench_codes.append(sector_bmk)
                 else:
                     print(f"[WARN] 行业基准 {sector_bmk} 无数据，回退仅使用 ^HSI")
@@ -186,8 +189,15 @@ def main() -> int:
                 sector_bmk = None
         bench_codes = list(dict.fromkeys(bench_codes))
 
-        engine = BacktestEngine(config=cfg, data_manager=dm, benchmark_codes=bench_codes, logger=print)
-        result = engine.run()
+        board_lots = parse_board_lot_overrides(config_path)
+        result = run_backtrader_backtest(
+            config=cfg,
+            data_manager=dm,
+            benchmark_codes=bench_codes,
+            logger=print,
+            board_lot_overrides=board_lots,
+            volume_fill_pct=float(args.volume_fill_pct),
+        )
 
         benchmark_for_metrics = None
         if sector_bmk and sector_bmk in result.benchmark_nav:
@@ -203,7 +213,15 @@ def main() -> int:
         sensitivity_df = pd.DataFrame()
         borrow_rates = list(cfg.sensitivity.borrow_rates or [])
         if borrow_rates:
-            sensitivity_df = mc.sensitivity_analysis(engine=engine, param="short_borrow_rate", values=borrow_rates)
+            sensitivity_df = run_backtrader_sensitivity(
+                config=cfg,
+                data_manager=dm,
+                benchmark_codes=bench_codes,
+                borrow_rates=borrow_rates,
+                logger=print,
+                board_lot_overrides=board_lots,
+                volume_fill_pct=float(args.volume_fill_pct),
+            )
 
         visualizer = ReportVisualizer(logger=print)
         report_path = visualizer.generate_report(
@@ -215,7 +233,6 @@ def main() -> int:
         )
 
         print_summary(cfg, metrics.summary_table, report_path, result.costs)
-
         if not args.no_browser:
             try:
                 webbrowser.open(report_path.as_uri())
@@ -226,6 +243,10 @@ def main() -> int:
     except ConfigError as exc:
         print(f"[CONFIG ERROR] {exc}")
         return 2
+    except ImportError as exc:
+        print(f"[IMPORT ERROR] {exc}")
+        print("请先安装 backtrader 依赖：pip install -r apps/backtest/requirements.txt")
+        return 2
     except Exception as exc:
         print(f"[ERROR] {exc}")
         return 1
@@ -233,3 +254,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

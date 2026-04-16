@@ -149,15 +149,23 @@ class DataManager:
             needs_update = max_cached < min(end_dt, stale_threshold)
             if needs_update:
                 fetch_start = max(start_dt, max_cached - timedelta(days=7))
-                fresh = self._download_with_fallback(c, fetch_start, end_dt, is_index=is_index)
-                merged = self._merge_frames(merged, fresh)
-                self.update_cache(c, merged)
+                try:
+                    fresh = self._download_with_fallback(c, fetch_start, end_dt, is_index=is_index)
+                    merged = self._merge_frames(merged, fresh)
+                    self.update_cache(c, merged)
+                except Exception as exc:
+                    # 网络波动/限流时回退到已有缓存，保证回测不中断。
+                    self.logger(f"[WARN] {c} 增量更新失败，回退使用本地缓存: {exc}")
         else:
             merged = self._download_with_fallback(c, start_dt, end_dt, is_index=is_index)
             self.update_cache(c, merged)
 
         out = merged.loc[(merged.index.date >= start_dt) & (merged.index.date <= end_dt)].copy()
         out = self._standardize_columns(out)
+        if not out.empty:
+            max_out = out.index.max().date()
+            if max_out < end_dt:
+                self.logger(f"[WARN] {c} 仅使用缓存至 {max_out}，未覆盖到 {end_dt}")
         self._warn_anomaly(c, out)
         return out
 
