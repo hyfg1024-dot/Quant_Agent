@@ -55,7 +55,7 @@ class DataManager:
             df = pd.read_csv(path)
             if "date" not in df.columns:
                 return None
-            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+            df["date"] = self._to_naive_datetime_index(df["date"])
             df = df.set_index("date").sort_index()
             return self._standardize_columns(df)
         except Exception as exc:
@@ -69,11 +69,48 @@ class DataManager:
         out.insert(0, "date", out.index)
         out.to_csv(self._cache_path(code), index=False)
 
-    def validate_universe(self, universe: List[str], start: str, end: str) -> Dict[str, Dict[str, Any]]:
+    def validate_universe(
+        self,
+        universe: List[str],
+        start: str,
+        end: str,
+        prefer_cache: bool = False,
+        check_missing_online: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
         """Validate data availability for a list of symbols."""
         report: Dict[str, Dict[str, Any]] = {}
+        start_dt = pd.Timestamp(start).date()
+        end_dt = pd.Timestamp(end).date()
         for code in universe:
             try:
+                if prefer_cache:
+                    cached = self.get_cached_data(code)
+                    if cached is not None and not cached.empty:
+                        df_cached = cached.loc[(cached.index.date >= start_dt) & (cached.index.date <= end_dt)]
+                        if not df_cached.empty:
+                            last_dt = df_cached.index.max().date()
+                            msg = "本地缓存命中"
+                            if last_dt < end_dt:
+                                msg = f"本地缓存命中（未覆盖到 {end_dt}）"
+                            report[code] = {
+                                "status": "ok_cache",
+                                "rows": int(len(df_cached)),
+                                "start": str(df_cached.index.min().date()),
+                                "end": str(last_dt),
+                                "message": msg,
+                            }
+                            continue
+
+                    if not check_missing_online:
+                        report[code] = {
+                            "status": "cache_miss",
+                            "rows": 0,
+                            "start": "",
+                            "end": "",
+                            "message": "未命中本地缓存（可用 --validate-online 做全量在线校验）",
+                        }
+                        continue
+
                 df = self.fetch_stock_data(code, start=start, end=end)
                 if df.empty:
                     report[code] = {
@@ -266,7 +303,7 @@ class DataManager:
             raise RuntimeError(f"akshare 字段不足: {code}")
 
         out = pd.DataFrame()
-        out.index = pd.to_datetime(df[date_col]).tz_localize(None)
+        out.index = self._to_naive_datetime_index(df[date_col])
         out["open"] = pd.to_numeric(df[open_col], errors="coerce") if open_col else np.nan
         out["high"] = pd.to_numeric(df[high_col], errors="coerce") if high_col else np.nan
         out["low"] = pd.to_numeric(df[low_col], errors="coerce") if low_col else np.nan
@@ -309,7 +346,7 @@ class DataManager:
             raise RuntimeError("akshare ^HSI 字段不足")
 
         out = pd.DataFrame()
-        out.index = pd.to_datetime(df[date_col]).tz_localize(None)
+        out.index = self._to_naive_datetime_index(df[date_col])
         out["open"] = pd.to_numeric(df[open_col], errors="coerce") if open_col else np.nan
         out["high"] = pd.to_numeric(df[high_col], errors="coerce") if high_col else np.nan
         out["low"] = pd.to_numeric(df[low_col], errors="coerce") if low_col else np.nan
@@ -339,8 +376,15 @@ class DataManager:
             if c not in out.columns:
                 out[c] = np.nan
             out[c] = pd.to_numeric(out[c], errors="coerce")
-        out.index = pd.to_datetime(out.index).tz_localize(None)
+        out.index = self._to_naive_datetime_index(out.index)
         return out[["open", "high", "low", "close", "adj_close", "volume"]].sort_index()
+
+    def _to_naive_datetime_index(self, values: Any) -> pd.DatetimeIndex:
+        """Convert any datetime-like values to naive DatetimeIndex."""
+        idx = pd.DatetimeIndex(pd.to_datetime(values, errors="coerce"))
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        return idx
 
     def _warn_anomaly(self, code: str, df: pd.DataFrame) -> None:
         if df.empty:

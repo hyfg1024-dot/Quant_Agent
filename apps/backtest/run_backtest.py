@@ -14,6 +14,7 @@ import pandas as pd
 from src.config_loader import ConfigError, load_strategy, load_universe
 
 if TYPE_CHECKING:
+    from src.backtest_engine import BacktestResult
     from src.config_loader import StrategyConfig, UniverseConfig
     from src.data_manager import DataManager
 
@@ -25,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="reports", help="报告输出目录")
 
     parser.add_argument("--validate-universe", action="store_true", help="仅验证标的池数据可用性")
+    parser.add_argument("--validate-online", action="store_true", help="校验Universe时强制在线拉取（较慢）")
     parser.add_argument("--update-data-only", action="store_true", help="仅更新数据缓存，不运行回测")
     parser.add_argument("--sector", default="", help="验证或更新时限定某个板块 key")
     parser.add_argument("--start", default="2021-01-01", help="validate/update 模式起始日期")
@@ -32,6 +34,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--rf-rate", type=float, default=0.03, help="无风险利率，默认 3%%")
     parser.add_argument("--volume-fill-pct", type=float, default=0.20, help="单日成交量可撮合比例，默认 20%%")
+    parser.add_argument("--skip-sensitivity", action="store_true", help="跳过融券费率敏感性分析（加速模式）")
     parser.add_argument("--no-browser", action="store_true", help="生成报告后不自动打开浏览器")
     return parser.parse_args()
 
@@ -88,10 +91,24 @@ def update_data_cache(dm: "DataManager", universe: "UniverseConfig", start: str,
             print(f"  [ERR] {b:<10} {exc}")
 
 
-def validate_universe(dm: "DataManager", universe: "UniverseConfig", start: str, end: str, sector: str = "") -> int:
+def validate_universe(
+    dm: "DataManager",
+    universe: "UniverseConfig",
+    start: str,
+    end: str,
+    sector: str = "",
+    validate_online: bool = False,
+) -> int:
     codes = get_codes_from_universe(universe, sector)
-    print(f"[CHECK] 校验标的数量: {len(codes)}")
-    report = dm.validate_universe(codes, start=start, end=end)
+    mode = "在线全量" if validate_online else "本地缓存优先"
+    print(f"[CHECK] 校验标的数量: {len(codes)} | 模式: {mode}")
+    report = dm.validate_universe(
+        codes,
+        start=start,
+        end=end,
+        prefer_cache=not validate_online,
+        check_missing_online=validate_online,
+    )
 
     ok = 0
     for code in codes:
@@ -102,7 +119,7 @@ def validate_universe(dm: "DataManager", universe: "UniverseConfig", start: str,
         e = str(item.get("end", ""))
         msg = str(item.get("message", ""))
         print(f"{code:<10} | {status:<6} | rows={rows:<5} | {s} -> {e} | {msg}")
-        if status == "ok":
+        if status in {"ok", "ok_cache"}:
             ok += 1
     print(f"[CHECK] 完成: ok={ok}, total={len(codes)}")
     return 0 if ok > 0 else 2
@@ -110,6 +127,7 @@ def validate_universe(dm: "DataManager", universe: "UniverseConfig", start: str,
 
 def print_summary(
     cfg: "StrategyConfig",
+    result: "BacktestResult",
     summary: pd.DataFrame,
     report_path: Path,
     costs: Dict[str, float],
@@ -117,6 +135,24 @@ def print_summary(
     print("\n=== 回测完成（Backtrader）===")
     print(f"策略: {cfg.strategy_name}")
     print(f"区间: {cfg.backtest.start_date} -> {cfg.backtest.end_date}")
+    effective_portfolio_end = (
+        pd.to_datetime(result.daily_portfolio_value.index).max().date()
+        if result.daily_portfolio_value is not None and not result.daily_portfolio_value.empty
+        else None
+    )
+    effective_benchmark_end = None
+    if result.benchmark_nav:
+        last_dates = [
+            pd.to_datetime(s.index).max().date() for s in result.benchmark_nav.values() if s is not None and not s.empty
+        ]
+        if last_dates:
+            effective_benchmark_end = max(last_dates)
+    if effective_portfolio_end:
+        print(f"有效净值截止: {effective_portfolio_end}")
+    if effective_benchmark_end:
+        print(f"有效基准截止: {effective_benchmark_end}")
+    if effective_portfolio_end and effective_portfolio_end < cfg.backtest.end_date:
+        print(f"[WARN] 请求截止日 {cfg.backtest.end_date} 超过有效净值截止 {effective_portfolio_end}（缓存回退运行）")
 
     if "portfolio" in summary.index:
         p = summary.loc["portfolio"]
@@ -151,6 +187,7 @@ def main() -> int:
         from src.metrics import MetricsCalculator
         from src.visualizer import ReportVisualizer
         from strategies.long_short_bt import (
+            prepare_backtrader_input,
             parse_board_lot_overrides,
             run_backtrader_backtest,
             run_backtrader_sensitivity,
@@ -163,7 +200,14 @@ def main() -> int:
         end = resolve_end_date(args.end)
 
         if args.validate_universe:
-            return validate_universe(dm, universe, start=start, end=end, sector=args.sector)
+            return validate_universe(
+                dm,
+                universe,
+                start=start,
+                end=end,
+                sector=args.sector,
+                validate_online=bool(args.validate_online),
+            )
         if args.update_data_only:
             update_data_cache(dm, universe, start=start, end=end, sector=args.sector)
             return 0
@@ -190,6 +234,13 @@ def main() -> int:
         bench_codes = list(dict.fromkeys(bench_codes))
 
         board_lots = parse_board_lot_overrides(config_path)
+        prepared_input = prepare_backtrader_input(
+            config=cfg,
+            data_manager=dm,
+            benchmark_codes=bench_codes,
+            logger=print,
+            board_lot_overrides=board_lots,
+        )
         result = run_backtrader_backtest(
             config=cfg,
             data_manager=dm,
@@ -197,6 +248,7 @@ def main() -> int:
             logger=print,
             board_lot_overrides=board_lots,
             volume_fill_pct=float(args.volume_fill_pct),
+            prepared_input=prepared_input,
         )
 
         benchmark_for_metrics = None
@@ -212,7 +264,9 @@ def main() -> int:
 
         sensitivity_df = pd.DataFrame()
         borrow_rates = list(cfg.sensitivity.borrow_rates or [])
-        if borrow_rates:
+        if args.skip_sensitivity:
+            print("[INFO] 已启用加速模式：跳过融券费率敏感性分析")
+        elif borrow_rates:
             sensitivity_df = run_backtrader_sensitivity(
                 config=cfg,
                 data_manager=dm,
@@ -221,6 +275,7 @@ def main() -> int:
                 logger=print,
                 board_lot_overrides=board_lots,
                 volume_fill_pct=float(args.volume_fill_pct),
+                prepared_input=prepared_input,
             )
 
         visualizer = ReportVisualizer(logger=print)
@@ -232,7 +287,7 @@ def main() -> int:
             output_dir=output_dir,
         )
 
-        print_summary(cfg, metrics.summary_table, report_path, result.costs)
+        print_summary(cfg, result, metrics.summary_table, report_path, result.costs)
         if not args.no_browser:
             try:
                 webbrowser.open(report_path.as_uri())
@@ -254,4 +309,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
