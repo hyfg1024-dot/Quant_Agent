@@ -1,12 +1,43 @@
+from __future__ import annotations
+
+import asyncio
 from typing import Dict, List, Optional, Tuple
 
 import akshare as ak
 import pandas as pd
 import requests
+import os
+import sys
+from pathlib import Path
+try:
+    import aiohttp
+except Exception:  # pragma: no cover
+    aiohttp = None  # type: ignore[assignment]
+
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from shared.data_provider import AkshareDataProvider, FallbackDataProvider, QMTDataProvider
+
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover - 非 Streamlit 环境兜底
+    st = None  # type: ignore[assignment]
 
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={exchange}{symbol}"
 TENCENT_MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={exchange}{symbol}"
 TENCENT_DAILY_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={exchange}{symbol},day,,,{count},qfq"
+
+
+def _cache_data(ttl: int = 3600):
+    def _decorator(func):
+        if st is None:
+            return func
+        return st.cache_data(ttl=ttl, show_spinner=False)(func)
+
+    return _decorator
 
 
 def _to_float(value) -> Optional[float]:
@@ -205,10 +236,34 @@ def _fetch_tencent_quote(symbol: str) -> Dict:
     return _parse_tencent_fields(normalized, fields)
 
 
-def fetch_realtime_quote(symbol: str) -> Dict:
-    normalized = _normalize_symbol(symbol)
+async def _fetch_tencent_quote_async(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    sem: Optional[asyncio.Semaphore] = None,
+) -> Dict:
+    exchange, normalized = _resolve_market(symbol)
+    url = TENCENT_QUOTE_URL.format(exchange=exchange, symbol=normalized)
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        return _fetch_tencent_quote(symbol)
+        if sem is None:
+            async with session.get(url, headers=headers) as resp:
+                resp.raise_for_status()
+                body = await resp.read()
+        else:
+            async with sem:
+                async with session.get(url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    body = await resp.read()
+        text = body.decode("gbk", errors="ignore")
+        if '"' not in text or '~' not in text:
+            raise ValueError("No Tencent quote payload")
+        payload = text.split('"', 1)[1].rsplit('"', 1)[0]
+        fields = payload.split("~")
+        out = _parse_tencent_fields(normalized, fields)
+        out["provider_used"] = "fallback_async"
+        out["provider_fallback_reason"] = ""
+        out["qmt_enabled"] = _qmt_enabled_from_env()
+        return out
     except Exception as exc:
         return {
             "symbol": normalized,
@@ -241,11 +296,150 @@ def fetch_realtime_quote(symbol: str) -> Dict:
                 "buy": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(10)],
                 "sell": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(10)],
             },
+            "provider_used": "error",
+            "provider_fallback_reason": "",
+            "qmt_enabled": _qmt_enabled_from_env(),
             "error": str(exc),
         }
 
 
-def fetch_intraday_flow(symbol: str) -> pd.DataFrame:
+_DATA_PROVIDER = None
+
+
+def _qmt_enabled_from_env() -> bool:
+    raw = str(os.getenv("QMT_ENABLED", "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _get_data_provider():
+    global _DATA_PROVIDER
+    if _DATA_PROVIDER is None:
+        qmt_enabled = _qmt_enabled_from_env()
+        _DATA_PROVIDER = FallbackDataProvider(
+            primary=QMTDataProvider(timeout_sec=1.2, enabled=qmt_enabled),
+            fallback=AkshareDataProvider(
+                quote_fetcher=_fetch_tencent_quote,
+                intraday_fetcher=_fetch_tencent_intraday_flow,
+                kline_fetcher=_fetch_tencent_kline,
+            ),
+        )
+    return _DATA_PROVIDER
+
+
+def fetch_realtime_quote(symbol: str) -> Dict:
+    normalized = _normalize_symbol(symbol)
+    try:
+        provider = _get_data_provider()
+        quote = provider.get_quote(normalized)
+        if "order_book_10" not in quote and "order_book_5" in quote:
+            ob5 = quote.get("order_book_5", {"buy": [], "sell": []})
+            quote["order_book_10"] = _build_order_book_10(
+                ob5.get("buy", []),
+                ob5.get("sell", []),
+            )
+        quote["symbol"] = normalized
+        quote["provider_used"] = getattr(provider, "last_provider", "fallback")
+        quote["provider_fallback_reason"] = getattr(provider, "last_fallback_reason", "")
+        quote["qmt_enabled"] = _qmt_enabled_from_env()
+        return quote
+    except Exception as exc:
+        return {
+            "symbol": normalized,
+            "name": normalized,
+            "current_price": None,
+            "prev_close": None,
+            "open": None,
+            "change_amount": None,
+            "change_pct": None,
+            "high": None,
+            "low": None,
+            "volume": None,
+            "amount": None,
+            "turnover_rate": None,
+            "turnover_rate_estimated": False,
+            "amplitude_pct": None,
+            "float_market_value_yi": None,
+            "total_market_value_yi": None,
+            "volume_ratio": None,
+            "order_diff": None,
+            "vwap": None,
+            "premium_pct": None,
+            "quote_time": None,
+            "is_trading_data": False,
+            "pe_dynamic": None,
+            "pe_ttm": None,
+            "pb": None,
+            "order_book_5": {"buy": [], "sell": []},
+            "order_book_10": {
+                "buy": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(10)],
+                "sell": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(10)],
+            },
+            "provider_used": "error",
+            "provider_fallback_reason": "",
+            "qmt_enabled": _qmt_enabled_from_env(),
+            "error": str(exc),
+        }
+
+
+async def _fetch_realtime_quotes_batch_async(
+    symbols: List[str],
+    timeout_sec: float = 1.2,
+    max_concurrency: int = 12,
+) -> Dict[str, Dict]:
+    if aiohttp is None:
+        return {sym: fetch_realtime_quote(sym) for sym in symbols}
+    normalized_symbols = [_normalize_symbol(s) for s in symbols if str(s).strip()]
+    if not normalized_symbols:
+        return {}
+
+    connector = aiohttp.TCPConnector(limit=max(4, int(max_concurrency)))
+    timeout = aiohttp.ClientTimeout(total=max(0.6, float(timeout_sec)))
+    sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+    out: Dict[str, Dict] = {}
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        tasks = [_fetch_tencent_quote_async(session, sym, sem) for sym in normalized_symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for sym, item in zip(normalized_symbols, results):
+            if isinstance(item, Exception):
+                out[sym] = fetch_realtime_quote(sym)
+            else:
+                out[sym] = item
+    return out
+
+
+def fetch_realtime_quotes_batch(
+    symbols: List[str],
+    timeout_sec: float = 1.2,
+    max_concurrency: int = 12,
+) -> Dict[str, Dict]:
+    """
+    批量实时行情（并发）。
+    - 默认走 aiohttp + asyncio.gather（免费接口）
+    - 当 QMT 开关开启时，为保持口径一致，退化为逐只 provider 调用
+    """
+    normalized_symbols = [_normalize_symbol(s) for s in symbols if str(s).strip()]
+    if not normalized_symbols:
+        return {}
+
+    if _qmt_enabled_from_env():
+        return {sym: fetch_realtime_quote(sym) for sym in normalized_symbols}
+    if aiohttp is None:
+        return {sym: fetch_realtime_quote(sym) for sym in normalized_symbols}
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            _fetch_realtime_quotes_batch_async(
+                normalized_symbols,
+                timeout_sec=timeout_sec,
+                max_concurrency=max_concurrency,
+            )
+        )
+    finally:
+        loop.close()
+
+
+def _fetch_tencent_intraday_flow(symbol: str) -> pd.DataFrame:
     exchange, normalized = _resolve_market(symbol)
     url = TENCENT_MINUTE_URL.format(exchange=exchange, symbol=normalized)
     resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
@@ -281,6 +475,59 @@ def fetch_intraday_flow(symbol: str) -> pd.DataFrame:
     df["volume_lot"] = df["volume_lot_cum"].diff().fillna(df["volume_lot_cum"])
     df["volume_lot"] = df["volume_lot"].clip(lower=0)
     return df[["time", "price", "volume_lot", "amount"]]
+
+
+async def _fetch_tencent_intraday_flow_async(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
+    exchange, normalized = _resolve_market(symbol)
+    url = TENCENT_MINUTE_URL.format(exchange=exchange, symbol=normalized)
+    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        resp.raise_for_status()
+        payload = await resp.json(content_type=None)
+
+    code_key = f"{exchange}{normalized}"
+    target = payload.get("data", {}).get(code_key, {})
+    data_obj = target.get("data", {})
+    raw_lines = data_obj.get("data", [])
+    trade_date = str(data_obj.get("date", ""))
+
+    rows = []
+    for line in raw_lines:
+        parts = str(line).split()
+        if len(parts) < 4:
+            continue
+        hhmm, price_text, vol_text, amount_text = parts[:4]
+        time_text = f"{trade_date}{hhmm}" if trade_date else hhmm
+        rows.append(
+            {
+                "time": pd.to_datetime(time_text, format="%Y%m%d%H%M", errors="coerce"),
+                "price": _to_float(price_text),
+                "volume_lot_cum": _to_float(vol_text),
+                "amount": _to_float(amount_text),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["time", "price", "volume_lot", "amount"])
+
+    df = pd.DataFrame(rows).dropna(subset=["time"]).reset_index(drop=True)
+    df["volume_lot"] = df["volume_lot_cum"].diff().fillna(df["volume_lot_cum"])
+    df["volume_lot"] = df["volume_lot"].clip(lower=0)
+    return df[["time", "price", "volume_lot", "amount"]]
+
+
+def fetch_intraday_flow(symbol: str) -> pd.DataFrame:
+    normalized = _normalize_symbol(symbol)
+    try:
+        df = _get_data_provider().get_intraday_flow(normalized)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["time", "price", "volume_lot", "amount"])
+        keep_cols = ["time", "price", "volume_lot", "amount"]
+        for col in keep_cols:
+            if col not in df.columns:
+                df[col] = pd.NA
+        return df[keep_cols]
+    except Exception:
+        return pd.DataFrame(columns=["time", "price", "volume_lot", "amount"])
 
 
 def _calc_rsi(close: pd.Series, period: int = 6) -> pd.Series:
@@ -391,7 +638,36 @@ def _calc_indicators_from_ohlcv(df: pd.DataFrame) -> Dict[str, Optional[float]]:
     return _calc_indicator_set_from_close(close)
 
 
-def _fetch_daily_close_series(symbol: str, count: int = 320) -> pd.Series:
+async def _fetch_tencent_kline_async(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    count: int = 320,
+) -> pd.DataFrame:
+    exchange, normalized = _resolve_market(symbol)
+    url = TENCENT_DAILY_URL.format(exchange=exchange, symbol=normalized, count=count)
+    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        resp.raise_for_status()
+        payload = await resp.json(content_type=None)
+    code_key = f"{exchange}{normalized}"
+    kline_data = payload.get("data", {}).get(code_key, {}).get("qfqday", [])
+    if not kline_data:
+        raise ValueError("No daily kline data")
+    normalized_rows = [row[:6] for row in kline_data if len(row) >= 6]
+    if not normalized_rows:
+        raise ValueError("Invalid daily kline payload")
+    cols = ["date", "open", "close", "high", "low", "volume"]
+    df = pd.DataFrame(normalized_rows, columns=cols)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date")
+    if df.empty:
+        raise ValueError("No daily kline data")
+    return df[["date", "open", "high", "low", "close", "volume"]]
+
+
+@_cache_data(ttl=3600)
+def _fetch_tencent_kline_cached(symbol: str, count: int = 320) -> pd.DataFrame:
     exchange, normalized = _resolve_market(symbol)
     url = TENCENT_DAILY_URL.format(exchange=exchange, symbol=normalized, count=count)
     resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
@@ -401,22 +677,45 @@ def _fetch_daily_close_series(symbol: str, count: int = 320) -> pd.Series:
     kline_data = payload.get("data", {}).get(code_key, {}).get("qfqday", [])
     if not kline_data and exchange == "hk":
         hk = _fetch_hk_daily_ohlcv(normalized).copy()
-        hk.index = pd.to_datetime(hk.index, errors="coerce")
-        hk = hk.dropna(subset=["close"]).sort_index()
-        if not hk.empty:
-            return pd.to_numeric(hk["close"], errors="coerce").dropna()
-        raise ValueError("No daily close series")
+        hk = hk.reset_index().rename(columns={"index": "date"})
+        return hk[["date", "open", "high", "low", "close", "volume"]]
+    if not kline_data:
+        raise ValueError("No daily kline data")
 
-    rows = [row[:3] for row in kline_data if len(row) >= 3]
-    if not rows:
+    normalized_rows = [row[:6] for row in kline_data if len(row) >= 6]
+    if not normalized_rows:
+        raise ValueError("Invalid daily kline payload")
+    cols = ["date", "open", "close", "high", "low", "volume"]
+    df = pd.DataFrame(normalized_rows, columns=cols)
+    df = df.rename(columns={"close": "close", "high": "high", "low": "low", "open": "open", "volume": "volume"})
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date")
+    return df[["date", "open", "high", "low", "close", "volume"]]
+
+
+def _fetch_tencent_kline(symbol: str, count: int = 320) -> pd.DataFrame:
+    return _fetch_tencent_kline_cached(symbol, count=count).copy()
+
+
+@_cache_data(ttl=3600)
+def _fetch_daily_close_series_cached(symbol: str, count: int = 320) -> pd.Series:
+    normalized = _normalize_symbol(symbol)
+    kline_df = _get_data_provider().get_kline(normalized, count=count)
+    if kline_df is None or kline_df.empty:
         raise ValueError("No daily close series")
-    df = pd.DataFrame(rows, columns=["date", "open", "close"])
+    df = kline_df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df = df.dropna(subset=["date", "close"]).set_index("date").sort_index()
     if df.empty:
         raise ValueError("No daily close series")
     return df["close"]
+
+
+def _fetch_daily_close_series(symbol: str, count: int = 320) -> pd.Series:
+    return _fetch_daily_close_series_cached(symbol, count=count).copy()
 
 
 def fetch_multi_timeframe_rsi(symbol: str, intraday_df: Optional[pd.DataFrame] = None) -> Dict[str, Dict[str, Optional[float]]]:
@@ -472,6 +771,7 @@ def fetch_multi_timeframe_indicators(symbol: str, intraday_df: Optional[pd.DataF
     return result
 
 
+@_cache_data(ttl=3600)
 def _fetch_hk_daily_ohlcv(symbol: str) -> pd.DataFrame:
     df = ak.stock_hk_daily(symbol=str(symbol).zfill(5), adjust="qfq")
     if df is None or df.empty:
@@ -483,30 +783,68 @@ def _fetch_hk_daily_ohlcv(symbol: str) -> pd.DataFrame:
 
 
 def fetch_technical_indicators(symbol: str, count: int = 120) -> Dict[str, Optional[float]]:
-    exchange, normalized = _resolve_market(symbol)
-    url = TENCENT_DAILY_URL.format(exchange=exchange, symbol=normalized, count=count)
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    code_key = f"{exchange}{normalized}"
-    kline_data = payload.get("data", {}).get(code_key, {}).get("qfqday", [])
-    if not kline_data:
-        if exchange == "hk":
-            return _calc_indicators_from_ohlcv(_fetch_hk_daily_ohlcv(normalized))
+    normalized = _normalize_symbol(symbol)
+    df = _get_data_provider().get_kline(normalized, count=count)
+    if df is None or df.empty:
         raise ValueError("No daily kline data")
-
-    normalized_rows = [row[:6] for row in kline_data if len(row) >= 6]
-    if not normalized_rows:
-        raise ValueError("Invalid daily kline payload")
-
-    cols = ["date", "open", "close", "high", "low", "volume"]
-    df = pd.DataFrame(normalized_rows, columns=cols)
     return _calc_indicators_from_ohlcv(df[["open", "high", "low", "close", "volume"]])
 
 
+async def _fetch_fast_panel_bundle_async(symbol: str) -> Tuple[Dict, pd.DataFrame, Dict[str, Optional[float]], List[str]]:
+    if aiohttp is None:
+        raise RuntimeError("aiohttp_not_installed")
+    errors: List[str] = []
+    timeout = aiohttp.ClientTimeout(total=2.4)
+    connector = aiohttp.TCPConnector(limit=8)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        quote_task = _fetch_tencent_quote_async(session, symbol)
+        intraday_task = _fetch_tencent_intraday_flow_async(session, symbol)
+        kline_task = _fetch_tencent_kline_async(session, symbol, count=120)
+        quote_res, intraday_res, kline_res = await asyncio.gather(
+            quote_task,
+            intraday_task,
+            kline_task,
+            return_exceptions=True,
+        )
+
+    if isinstance(quote_res, Exception):
+        quote = fetch_realtime_quote(symbol)
+        errors.append(f"quote_async: {quote_res}")
+    else:
+        quote = quote_res
+
+    if isinstance(intraday_res, Exception):
+        intraday_df = pd.DataFrame(columns=["time", "price", "volume_lot", "amount"])
+        errors.append(f"intraday_async: {intraday_res}")
+    else:
+        intraday_df = intraday_res
+
+    if isinstance(kline_res, Exception):
+        indicators = {
+            "macd_hist": None,
+            "rsi6": None,
+            "rsi12": None,
+            "rsi24": None,
+            "ma5": None,
+            "ma10": None,
+            "ma20": None,
+            "ma60": None,
+            "boll_mid": None,
+            "boll_upper": None,
+            "boll_lower": None,
+            "boll_pct_b": None,
+            "boll_bandwidth": None,
+        }
+        errors.append(f"kline_async: {kline_res}")
+    else:
+        indicators = _calc_indicators_from_ohlcv(kline_res[["open", "high", "low", "close", "volume"]])
+
+    return quote, intraday_df, indicators, errors
+
+
 def fetch_fast_panel(symbol: str) -> Dict:
-    quote = fetch_realtime_quote(symbol)
+    normalized = _normalize_symbol(symbol)
+    quote: Optional[Dict] = None
 
     intraday_df = pd.DataFrame(columns=["time", "price", "volume_lot", "amount"])
     indicators = {
@@ -526,17 +864,34 @@ def fetch_fast_panel(symbol: str) -> Dict:
     }
     errors = []
 
-    try:
-        intraday_df = fetch_intraday_flow(symbol)
-    except Exception as exc:
-        errors.append(f"intraday: {exc}")
+    if not _qmt_enabled_from_env():
+        loop = asyncio.new_event_loop()
+        try:
+            quote, intraday_df, indicators, async_errors = loop.run_until_complete(
+                _fetch_fast_panel_bundle_async(normalized)
+            )
+            errors.extend(async_errors)
+        except Exception as exc:
+            errors.append(f"async_bundle: {exc}")
+        finally:
+            loop.close()
 
-    try:
-        indicators = fetch_technical_indicators(symbol)
-    except Exception as exc:
-        errors.append(f"indicators: {exc}")
+    if quote is None:
+        quote = fetch_realtime_quote(normalized)
 
-    tf_indicators = fetch_multi_timeframe_indicators(symbol, intraday_df=intraday_df)
+    if intraday_df is None or intraday_df.empty:
+        try:
+            intraday_df = fetch_intraday_flow(normalized)
+        except Exception as exc:
+            errors.append(f"intraday: {exc}")
+
+    if indicators.get("rsi6") is None and indicators.get("ma20") is None:
+        try:
+            indicators = fetch_technical_indicators(normalized)
+        except Exception as exc:
+            errors.append(f"indicators: {exc}")
+
+    tf_indicators = fetch_multi_timeframe_indicators(normalized, intraday_df=intraday_df)
     rsi_multi = {
         k: {"rsi6": v.get("rsi6"), "rsi12": v.get("rsi12"), "rsi24": v.get("rsi24")}
         for k, v in tf_indicators.items()
@@ -552,14 +907,14 @@ def fetch_fast_panel(symbol: str) -> Dict:
             if row.get("price") is not None and row.get("volume_lot") is not None:
                 non_null_levels += 1
 
-    exchange = _resolve_exchange(symbol)
+    exchange = _resolve_exchange(normalized)
     if exchange == "hk" and non_null_levels <= 2:
         depth_note = "港股免费接口通常仅稳定提供买1/卖1，买2-买5与卖2-卖5可能为空。"
     else:
         depth_note = "当前使用公开免费接口的买5卖5盘口数据。"
 
     return {
-        "symbol": symbol,
+        "symbol": normalized,
         "quote": quote,
         "indicators": indicators,
         "intraday": intraday_df,

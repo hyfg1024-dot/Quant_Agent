@@ -1,0 +1,48 @@
+strategy_name: "V3_Phase1_信号监测"
+description: "轻仓买弱卖强，监测底部信号"
+sector: "real_estate"
+
+backtest:
+  start_date: "2021-01-01"
+  end_date: "today"
+
+capital:
+  total: 1000000
+  rmb_to_hkd_rate: 1.1
+  long_pct: 0.15
+  short_pct: 0.10
+  cash_buffer_pct: 0.75
+
+long_positions:
+  - code: "0960.HK"    # 龙湖
+    weight: 0.35
+  - code: "3990.HK"    # 美的置业
+    weight: 0.25
+  - code: "3900.HK"    # 绿城中国
+    weight: 0.25
+  - code: "3383.HK"    # 雅居乐
+    weight: 0.15
+
+short_positions:
+  - code: "1109.HK"    # 华润置地
+    weight: 0.50
+  - code: "0688.HK"    # 中海外发展
+    weight: 0.50
+
+weighting_mode: "manual"
+rebalance:
+  frequency: "monthly"
+  day: 1
+costs:
+  commission_rate: 0.0015
+  slippage: 0.001
+  short_borrow_rate: 0.10
+stop_loss:
+  single_long_stop: -0.30
+  single_long_action: "halve"
+  single_short_stop: 0.30
+  single_short_action: "close"
+  portfolio_stop: -0.10
+  portfolio_action: "close_all"
+sensitivity:
+  borrow_rates: [0.05, 0.08, 0.10, 0.15, 0.20]

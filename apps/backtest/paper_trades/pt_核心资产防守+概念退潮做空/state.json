@@ -1,0 +1,59 @@
+{
+  "run_id": "pt_核心资产防守+概念退潮做空",
+  "strategy_name": "V5_核心资产防守",
+  "config_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/strategies/核心资产防守 + 概念退潮做空.yaml",
+  "universe_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/universe.yaml",
+  "created_at": "2026-04-11 12:57:37",
+  "last_update_date": "2026-04-10",
+  "initial_capital_hkd": 1100000.0,
+  "cash": 841504.7898231809,
+  "shares": {
+    "0020.HK": -54000.0,
+    "0700.HK": 0.0,
+    "0883.HK": 2000.0,
+    "0939.HK": 12000.0,
+    "0941.HK": 2500.0,
+    "2331.HK": -4000.0,
+    "3900.HK": 12000.0
+  },
+  "entry_price": {
+    "0020.HK": 2.009999990463257,
+    "0700.HK": null,
+    "0883.HK": 26.520000457763672,
+    "0939.HK": 8.449999809265137,
+    "0941.HK": 81.0999984741211,
+    "2331.HK": 23.0,
+    "3900.HK": 8.350000381469727
+  },
+  "prev_price": {
+    "0020.HK": 2.009999990463257,
+    "0700.HK": 504.5,
+    "0883.HK": 26.520000457763672,
+    "0939.HK": 8.449999809265137,
+    "0941.HK": 81.0999984741211,
+    "2331.HK": 23.0,
+    "3900.HK": 8.350000381469727
+  },
+  "board_lots": {
+    "0020.HK": 1000,
+    "0700.HK": 1000,
+    "0883.HK": 1000,
+    "0939.HK": 1000,
+    "0941.HK": 500,
+    "2331.HK": 1000,
+    "3900.HK": 1000
+  },
+  "short_enabled": {
+    "0020.HK": true,
+    "2331.HK": true
+  },
+  "costs": {
+    "trade_fee_total": 987.2802733118533,
+    "borrow_fee_total": 0.0
+  },
+  "flags": {
+    "terminated": false,
+    "long_stop_triggered": [],
+    "short_stop_triggered": []
+  }
+}

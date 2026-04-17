@@ -1,0 +1,51 @@
+{
+  "run_id": "pt_房地产多空对冲",
+  "strategy_name": "房地产多空对冲_方案A",
+  "config_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/strategies/房地产多空对冲.yaml",
+  "universe_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/universe.yaml",
+  "created_at": "2026-04-11 12:01:56",
+  "last_update_date": "2026-04-10",
+  "initial_capital_hkd": 1100000.0,
+  "cash": 822494.8593042607,
+  "shares": {
+    "0688.HK": 15000.0,
+    "0960.HK": 21000.0,
+    "1109.HK": 6000.0,
+    "1918.HK": -104000.0,
+    "2007.HK": -436000.0
+  },
+  "entry_price": {
+    "0688.HK": 11.93000030517578,
+    "0960.HK": 7.679999828338623,
+    "1109.HK": 29.420000076293945,
+    "1918.HK": 1.0399999618530271,
+    "2007.HK": 0.3050000071525574
+  },
+  "prev_price": {
+    "0688.HK": 11.93000030517578,
+    "0960.HK": 7.679999828338623,
+    "1109.HK": 29.420000076293945,
+    "1918.HK": 1.0399999618530271,
+    "2007.HK": 0.3050000071525574
+  },
+  "board_lots": {
+    "0688.HK": 1000,
+    "0960.HK": 1000,
+    "1109.HK": 2000,
+    "1918.HK": 1000,
+    "2007.HK": 1000
+  },
+  "short_enabled": {
+    "2007.HK": true,
+    "1918.HK": true
+  },
+  "costs": {
+    "trade_fee_total": 1137.2484158760308,
+    "borrow_fee_total": 0.0
+  },
+  "flags": {
+    "terminated": false,
+    "long_stop_triggered": [],
+    "short_stop_triggered": []
+  }
+}

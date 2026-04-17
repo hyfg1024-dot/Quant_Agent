@@ -1,45 +1,191 @@
 benchmarks:
-  - code: "^HSI"
-    name: "恒生指数"
-    description: "大盘基准"
-  - code: "^HSPI"
-    name: "恒生地产分类指数"
-    description: "房地产行业基准"
-
+- code: ^HSI
+  name: 恒生指数
+  description: 大盘基准
+- code: ^HSPI
+  name: 恒生地产分类指数
+  description: 房地产行业基准
 sectors:
   real_estate:
-    name: "房地产开发"
-    description: "港股上市的房地产开发企业"
-    sector_benchmark: "^HSPI"
+    name: 房地产开发
+    description: 港股上市的房地产开发企业
+    sector_benchmark: ^HSPI
     groups:
       soe:
-        name: "央企/国企"
+        name: 央企/国企
         stocks:
-          - { code: "1109.HK", name: "华润置地", tags: ["央企", "商业地产"] }
-          - { code: "0688.HK", name: "中海外发展", tags: ["央企", "利润率高"] }
-          - { code: "0123.HK", name: "越秀地产", tags: ["地方国企", "TOD模式"] }
-          - { code: "1908.HK", name: "建发国际", tags: ["地方国企", "逆势扩张"] }
-          - { code: "0081.HK", name: "中国海外宏洋", tags: ["央企", "三四线"] }
-          - { code: "0119.HK", name: "保利置业", tags: ["央企"] }
-          - { code: "3900.HK", name: "绿城中国", tags: ["国企控股", "产品力强"] }
-          - { code: "1209.HK", name: "华润万象生活", tags: ["央企", "物管"] }
-
+        - code: 1109.HK
+          name: 华润置地
+          tags:
+          - 央企
+          - 商业地产
+        - code: 0688.HK
+          name: 中海外发展
+          tags:
+          - 央企
+          - 利润率高
+        - code: 0123.HK
+          name: 越秀地产
+          tags:
+          - 地方国企
+          - TOD模式
+        - code: 1908.HK
+          name: 建发国际
+          tags:
+          - 地方国企
+          - 逆势扩张
+        - code: 0081.HK
+          name: 中国海外宏洋
+          tags:
+          - 央企
+          - 三四线
+        - code: 0119.HK
+          name: 保利置业
+          tags:
+          - 央企
+        - code: 3900.HK
+          name: 绿城中国
+          tags:
+          - 国企控股
+          - 产品力强
+        - code: 1209.HK
+          name: 华润万象生活
+          tags:
+          - 央企
+          - 物管
       quality_private:
-        name: "优质民企"
+        name: 优质民企
         stocks:
-          - { code: "0960.HK", name: "龙湖集团", tags: ["民企标杆", "商业+物管"] }
-          - { code: "3990.HK", name: "美的置业", tags: ["民企", "制造业背景"] }
-
+        - code: 0960.HK
+          name: 龙湖集团
+          tags:
+          - 民企标杆
+          - 商业+物管
+        - code: 3990.HK
+          name: 美的置业
+          tags:
+          - 民企
+          - 制造业背景
       distressed:
-        name: "出险/承压民企"
+        name: 出险/承压民企
         stocks:
-          - { code: "2007.HK", name: "碧桂园", tags: ["已违约", "三四线为主"] }
-          - { code: "1918.HK", name: "融创中国", tags: ["重组中"] }
-          - { code: "0813.HK", name: "世茂集团", tags: ["已违约"] }
-          - { code: "0884.HK", name: "旭辉控股", tags: ["已违约"] }
-          - { code: "3333.HK", name: "中国恒大", tags: ["已清盘"] }
-          - { code: "1638.HK", name: "佳兆业", tags: ["已违约"] }
-          - { code: "3883.HK", name: "中国奥园", tags: ["已违约"] }
-          - { code: "3383.HK", name: "雅居乐", tags: ["承压"] }
-          - { code: "3377.HK", name: "远洋集团", tags: ["国资背景", "已违约"] }
-          - { code: "2777.HK", name: "富力地产", tags: ["已违约"] }
+        - code: 2007.HK
+          name: 碧桂园
+          tags:
+          - 已违约
+          - 三四线为主
+        - code: 1918.HK
+          name: 融创中国
+          tags:
+          - 重组中
+        - code: 0813.HK
+          name: 世茂集团
+          tags:
+          - 已违约
+        - code: 0884.HK
+          name: 旭辉控股
+          tags:
+          - 已违约
+        - code: 3333.HK
+          name: 中国恒大
+          tags:
+          - 已清盘
+        - code: 1638.HK
+          name: 佳兆业
+          tags:
+          - 已违约
+        - code: 3883.HK
+          name: 中国奥园
+          tags:
+          - 已违约
+        - code: 3383.HK
+          name: 雅居乐
+          tags:
+          - 承压
+        - code: 3377.HK
+          name: 远洋集团
+          tags:
+          - 国资背景
+          - 已违约
+        - code: 2777.HK
+          name: 富力地产
+          tags:
+          - 已违约
+  auto_import:
+    name: 自动补全
+    description: 由策略校验按钮自动补齐的标的
+    sector_benchmark: ^HSI
+    groups:
+      from_strategy:
+        name: 来自策略
+        stocks:
+        - code: 0941.HK
+          name: 0941.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 0939.HK
+          name: 0939.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 0883.HK
+          name: 0883.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 0700.HK
+          name: 0700.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 0020.HK
+          name: 0020.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 2331.HK
+          name: 2331.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 1088.HK
+          name: 1088.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 9866.HK
+          name: 9866.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 9868.HK
+          name: 9868.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 0241.HK
+          name: 0241.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 2020.HK
+          name: 2020.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 3998.HK
+          name: 3998.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 1368.HK
+          name: 1368.HK
+          tags:
+          - auto-added
+          - from-strategy
+        - code: 1361.HK
+          name: 1361.HK
+          tags:
+          - auto-added
+          - from-strategy

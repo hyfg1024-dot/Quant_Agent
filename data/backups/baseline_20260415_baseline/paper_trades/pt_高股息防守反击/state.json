@@ -1,0 +1,60 @@
+{
+  "run_id": "pt_高股息防守反击",
+  "strategy_name": "V4_高股息防守对冲",
+  "config_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/strategies/高股息防守反击.yaml",
+  "universe_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/universe.yaml",
+  "created_at": "2026-04-11 12:57:48",
+  "last_update_date": "2026-04-10",
+  "initial_capital_hkd": 1100000.0,
+  "cash": 600561.3341733749,
+  "shares": {
+    "0241.HK": -9000.0,
+    "0883.HK": 7000.0,
+    "0939.HK": 22000.0,
+    "0941.HK": 2000.0,
+    "1088.HK": 4000.0,
+    "9866.HK": -1800.0,
+    "9868.HK": -1300.0
+  },
+  "entry_price": {
+    "0241.HK": 4.639999866485596,
+    "0883.HK": 26.520000457763672,
+    "0939.HK": 8.449999809265137,
+    "0941.HK": 81.0999984741211,
+    "1088.HK": 45.0,
+    "9866.HK": 48.7599983215332,
+    "9868.HK": 67.0
+  },
+  "prev_price": {
+    "0241.HK": 4.639999866485596,
+    "0883.HK": 26.520000457763672,
+    "0939.HK": 8.449999809265137,
+    "0941.HK": 81.0999984741211,
+    "1088.HK": 45.0,
+    "9866.HK": 48.7599983215332,
+    "9868.HK": 67.0
+  },
+  "board_lots": {
+    "0241.HK": 1000,
+    "0883.HK": 1000,
+    "0939.HK": 1000,
+    "0941.HK": 500,
+    "1088.HK": 500,
+    "9866.HK": 100,
+    "9868.HK": 100
+  },
+  "short_enabled": {
+    "9866.HK": true,
+    "9868.HK": true,
+    "0241.HK": true
+  },
+  "costs": {
+    "trade_fee_total": 1396.2976556005954,
+    "borrow_fee_total": 0.0
+  },
+  "flags": {
+    "terminated": false,
+    "long_stop_triggered": [],
+    "short_stop_triggered": []
+  }
+}

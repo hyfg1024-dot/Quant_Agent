@@ -1,0 +1,55 @@
+{
+  "run_id": "pt_房地产信号监测轻仓试探",
+  "strategy_name": "V3_Phase1_信号监测",
+  "config_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/strategies/房地产信号监测轻仓试探.yaml",
+  "universe_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/universe.yaml",
+  "created_at": "2026-04-11 13:04:25",
+  "last_update_date": "2026-04-10",
+  "initial_capital_hkd": 1100000.0,
+  "cash": 996999.9845926677,
+  "shares": {
+    "0688.HK": -4000.0,
+    "0960.HK": 7000.0,
+    "1109.HK": 0.0,
+    "3383.HK": 105000.0,
+    "3900.HK": 4000.0,
+    "3990.HK": 11000.0
+  },
+  "entry_price": {
+    "0688.HK": 11.93000030517578,
+    "0960.HK": 7.679999828338623,
+    "1109.HK": null,
+    "3383.HK": 0.2349999994039535,
+    "3900.HK": 8.350000381469727,
+    "3990.HK": 3.490000009536743
+  },
+  "prev_price": {
+    "0688.HK": 11.93000030517578,
+    "0960.HK": 7.679999828338623,
+    "1109.HK": 29.420000076293945,
+    "3383.HK": 0.2349999994039535,
+    "3900.HK": 8.350000381469727,
+    "3990.HK": 3.490000009536743
+  },
+  "board_lots": {
+    "0688.HK": 1000,
+    "0960.HK": 1000,
+    "1109.HK": 2000,
+    "3383.HK": 1000,
+    "3900.HK": 1000,
+    "3990.HK": 1000
+  },
+  "short_enabled": {
+    "1109.HK": true,
+    "0688.HK": true
+  },
+  "costs": {
+    "trade_fee_total": 297.07125987962627,
+    "borrow_fee_total": 0.0
+  },
+  "flags": {
+    "terminated": false,
+    "long_stop_triggered": [],
+    "short_stop_triggered": []
+  }
+}

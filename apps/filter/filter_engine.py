@@ -7,6 +7,7 @@ import os
 import random
 import re
 import sqlite3
+import socket
 import sys
 import time
 from datetime import datetime, timedelta
@@ -1015,6 +1016,153 @@ def _classify_error_type(text: Any) -> str:
     if "rate" in t or "429" in t or "too many requests" in t:
         return "rate_limit"
     return "other"
+
+
+def check_market_data_dns(hosts: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    检查行情源 DNS 是否可解析。只要有一个东财主机可解析即视为可执行更新。
+    """
+    target_hosts = hosts or [
+        "push2.eastmoney.com",
+        "82.push2.eastmoney.com",
+        "81.push2.eastmoney.com",
+        "72.push2.eastmoney.com",
+        "71.push2.eastmoney.com",
+    ]
+    detail: Dict[str, Dict[str, Any]] = {}
+    ok_hosts: List[str] = []
+    fail_hosts: List[str] = []
+
+    for host in target_hosts:
+        h = _safe_str(host)
+        if not h:
+            continue
+        try:
+            infos = socket.getaddrinfo(h, 443, proto=socket.IPPROTO_TCP)
+            ips = sorted({str(x[4][0]) for x in infos if isinstance(x, tuple) and len(x) >= 5 and x[4]})
+            detail[h] = {"ok": True, "ips": ips[:3]}
+            ok_hosts.append(h)
+        except Exception as exc:
+            detail[h] = {"ok": False, "error": _safe_str(exc)}
+            fail_hosts.append(h)
+
+    return {
+        "ok": len(ok_hosts) > 0,
+        "ok_hosts": ok_hosts,
+        "fail_hosts": fail_hosts,
+        "detail": detail,
+    }
+
+
+def get_baseline_build_progress(market_scope: str = "AH") -> Dict[str, Any]:
+    """
+    返回首轮建库进度。
+    说明：当前深补仅针对 A 股，因此 A+H 口径下统计的是 A 股深补进度。
+    """
+    scope = _safe_str(market_scope).upper() or "AH"
+    df = load_snapshot()
+    if df is None or df.empty:
+        return {
+            "scope": scope,
+            "effective_scope": "A" if scope in {"AH", "ALL"} else scope,
+            "snapshot_total": 0,
+            "eligible_total": 0,
+            "enriched_done": 0,
+            "remaining": 0,
+            "progress_ratio": 0.0,
+            "progress_pct": 0.0,
+        }
+
+    if "market" not in df.columns:
+        df["market"] = "A"
+    markets = df["market"].astype(str).str.upper()
+    if scope in {"AH", "ALL", "A"}:
+        effective_scope = "A"
+        eligible_mask = (markets == "A")
+    elif scope == "HK":
+        effective_scope = "HK"
+        eligible_mask = (markets == "HK")
+    else:
+        effective_scope = "A"
+        eligible_mask = (markets == "A")
+
+    eligible_df = df[eligible_mask].copy()
+    eligible_total = int(len(eligible_df))
+    if "data_quality" in eligible_df.columns:
+        dq = eligible_df["data_quality"].astype(str).str.lower().str.strip()
+        enriched_done = int(((dq == "full") | (dq == "partial")).sum())
+    elif "enriched_at" in eligible_df.columns:
+        enriched_series = eligible_df["enriched_at"].astype(str).str.strip()
+        enriched_done = int((enriched_series != "").sum())
+    else:
+        enriched_done = 0
+    remaining = max(0, eligible_total - enriched_done)
+    ratio = (enriched_done / eligible_total) if eligible_total > 0 else 0.0
+    return {
+        "scope": scope,
+        "effective_scope": effective_scope,
+        "snapshot_total": int(len(df)),
+        "eligible_total": eligible_total,
+        "enriched_done": enriched_done,
+        "remaining": remaining,
+        "progress_ratio": ratio,
+        "progress_pct": ratio * 100.0,
+    }
+
+
+def run_baseline_build_once(
+    market_scope: str = "AH",
+    enrich_batch: int = 600,
+    safe_mode: bool = True,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """
+    首轮建库推进一次：前置 DNS 检查，通过后按轮转补充一批。
+    """
+    scope = _safe_str(market_scope).upper() or "AH"
+    dns = check_market_data_dns()
+    before = get_baseline_build_progress(scope)
+
+    if not bool(dns.get("ok")):
+        return {
+            "skipped": True,
+            "reason": "数据源 DNS 不可达，已跳过本次首轮建库推进。",
+            "dns": dns,
+            "progress_before": before,
+            "progress_after": before,
+            "added": 0,
+            "completed": bool(before.get("remaining", 0) == 0 and before.get("eligible_total", 0) > 0),
+        }
+
+    stats = refresh_market_snapshot(
+        max_stocks=0,
+        enrich_top_n=max(0, int(enrich_batch)),
+        force_refresh=bool(force_refresh),
+        rotate_enrich=True,
+        market_scope=scope,
+        weekly_mode=False,
+        safe_mode=bool(safe_mode),
+    )
+    after = get_baseline_build_progress(scope)
+    added = max(0, int(after.get("enriched_done", 0)) - int(before.get("enriched_done", 0)))
+    completed = bool(after.get("eligible_total", 0) > 0 and after.get("remaining", 0) == 0)
+
+    _snapshot_meta_set("baseline_build_scope", scope)
+    _snapshot_meta_set("baseline_build_target", str(int(after.get("eligible_total", 0) or 0)))
+    _snapshot_meta_set("baseline_build_done", str(int(after.get("enriched_done", 0) or 0)))
+    _snapshot_meta_set("baseline_build_completed", "1" if completed else "0")
+
+    out = dict(stats)
+    out.update(
+        {
+            "dns": dns,
+            "progress_before": before,
+            "progress_after": after,
+            "added": added,
+            "completed": completed,
+        }
+    )
+    return out
 
 
 def refresh_market_snapshot(

@@ -1,6 +1,6 @@
 strategy_name: "科技多空对冲_示例"
-description: "示例配置，需先在 universe 中添加 tech 板块对应标的"
-sector: "tech"
+description: "示例配置（使用当前 universe 已收录代码）"
+sector: "auto_import"
 
 backtest:
   start_date: "2021-01-01"
@@ -16,13 +16,13 @@ capital:
 long_positions:
   - code: "0700.HK"
     weight: 0.5
-  - code: "9988.HK"
+  - code: "0941.HK"
     weight: 0.5
 
 short_positions:
-  - code: "1810.HK"
+  - code: "0939.HK"
     weight: 0.5
-  - code: "0981.HK"
+  - code: "0883.HK"
     weight: 0.5
 
 weighting_mode: "manual"

@@ -1,0 +1,69 @@
+# ============================================
+# 策略V4：高股息防守反击（哑铃对冲策略）
+# 核心逻辑：做多高股息防御性央企，做空无护城河的烧钱内卷行业（电车）
+# ============================================
+
+strategy_name: "V4_高股息防守对冲"
+description: "结构性行情下，买入高现金流央企（赚利息和避险重估），做空持续亏损且陷入价格战的新势力车企"
+sector: "" # 跨板块组合留空，基准会使用默认的 ^HSI
+
+# === 回测时间 ===
+# 建议从2023年开始跑，因为2023是高股息确立为主线、新能源开始杀估值的分水岭
+backtest:
+  start_date: "2023-01-01"
+  end_date: "today"
+
+# === 资金配置 ===
+capital:
+  total: 1000000
+  rmb_to_hkd_rate: 1.1
+  long_pct: 0.70          # 偏多头设计：因为多头全是稳定派息标的，自带防守
+  short_pct: 0.20         # 空头只需起到大盘暴跌时的保险作用
+  cash_buffer_pct: 0.10
+
+# === 多头标的：垄断型现金奶牛 ===
+long_positions:
+  - code: "0883.HK"    # 中国海油：高分红抗通胀
+    weight: 0.25
+  - code: "1088.HK"    # 中国神华：长协现金牛
+    weight: 0.25
+  - code: "0941.HK"    # 中国移动：电信防守龙头
+    weight: 0.25
+  - code: "0939.HK"    # 建设银行：底仓金融股息
+    weight: 0.25
+
+# === 空头标的：价格战受害者 ===
+short_positions:
+  - code: "9866.HK"    # 蔚来：持续烧钱
+    weight: 0.40
+  - code: "9868.HK"    # 小鹏：毛利承压
+    weight: 0.40
+  - code: "0241.HK"    # 阿里健康：预期见顶
+    weight: 0.20
+
+weighting_mode: "manual"
+
+# === 再平衡 ===
+# 高股息策略不需要频繁买卖，所以调低频率为季度
+rebalance:
+  frequency: "quarterly"
+  day: 1
+
+# === 交易成本 ===
+costs:
+  commission_rate: 0.0015
+  slippage: 0.001
+  short_borrow_rate: 0.10  # 这些大票借券相对容易
+
+# === 止损 ===
+stop_loss:
+  single_long_stop: -0.15     # 央企跌15%意味着宏观根本恶化，触发止损
+  single_long_action: "halve"
+  single_short_stop: 0.25     # 空头留点缓冲给轧空
+  single_short_action: "close"
+  portfolio_stop: -0.10
+  portfolio_action: "close_all"
+
+# === 敏感性分析 ===
+sensitivity:
+  borrow_rates: [0.03, 0.05, 0.08, 0.12]

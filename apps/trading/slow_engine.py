@@ -8,12 +8,25 @@ from typing import Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 import requests
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover
+    st = None  # type: ignore[assignment]
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quant_app.db"
+
+
+def _cache_data(ttl: int = 3600):
+    def _decorator(func):
+        if st is None:
+            return func
+        return st.cache_data(ttl=ttl, show_spinner=False)(func)
+
+    return _decorator
 
 STOCK_POOL: List[Tuple[str, str]] = [
     ("601088", "中国神华"),
@@ -437,6 +450,7 @@ def _fetch_hk_metrics_from_em(symbol: str) -> Dict[str, Optional[float]]:
         return {"pe_dynamic": None, "pe_static": None, "pe_rolling": None, "pb": None, "dividend_yield": None}
 
 
+@_cache_data(ttl=3600)
 def _fetch_boll_index(symbol: str) -> Optional[float]:
     try:
         if _is_hk_symbol(symbol):
@@ -472,6 +486,7 @@ def _fetch_boll_index(symbol: str) -> Optional[float]:
         return None
 
 
+@_cache_data(ttl=3600)
 def _fetch_dividend_yield_from_em(symbol: str) -> Optional[float]:
     try:
         df = ak.stock_fhps_detail_em(symbol=str(symbol))

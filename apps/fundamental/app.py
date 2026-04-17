@@ -375,11 +375,23 @@ def _format_card_desc_lines(text: str, max_lines: int = 3) -> str:
     return "".join(html_lines)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_analyze_watchlist(payload: str) -> List[Dict[str, Any]]:
+    try:
+        watchlist = json.loads(payload)
+    except Exception:
+        watchlist = []
+    if not isinstance(watchlist, list):
+        watchlist = []
+    return analyze_watchlist(watchlist, force_refresh=False)
+
+
 def _init_state() -> None:
     if "fnd_watchlist" not in st.session_state:
         st.session_state["fnd_watchlist"] = load_watchlist()
     if "fnd_rows" not in st.session_state:
-        st.session_state["fnd_rows"] = analyze_watchlist(st.session_state["fnd_watchlist"], force_refresh=False)
+        payload = json.dumps(st.session_state["fnd_watchlist"], ensure_ascii=False, sort_keys=True)
+        st.session_state["fnd_rows"] = _cached_analyze_watchlist(payload)
     if "fnd_selected_code" not in st.session_state:
         st.session_state["fnd_selected_code"] = st.session_state["fnd_rows"][0]["code"] if st.session_state["fnd_rows"] else ""
     if "fnd_deepseek_reports" not in st.session_state:
@@ -410,7 +422,11 @@ def _init_state() -> None:
 
 
 def _refresh_rows(force_refresh: bool = False) -> None:
-    st.session_state["fnd_rows"] = analyze_watchlist(st.session_state["fnd_watchlist"], force_refresh=force_refresh)
+    if force_refresh:
+        st.session_state["fnd_rows"] = analyze_watchlist(st.session_state["fnd_watchlist"], force_refresh=True)
+    else:
+        payload = json.dumps(st.session_state["fnd_watchlist"], ensure_ascii=False, sort_keys=True)
+        st.session_state["fnd_rows"] = _cached_analyze_watchlist(payload)
     if st.session_state["fnd_rows"] and not st.session_state["fnd_selected_code"]:
         st.session_state["fnd_selected_code"] = st.session_state["fnd_rows"][0]["code"]
 
@@ -498,6 +514,47 @@ def _render_dimension_cards(row: Dict[str, Any]) -> None:
 
 def _render_summary(row: Dict[str, Any]) -> None:
     code = row.get("code", "")
+    news_catalysts = _clean_text_no_na(str(row.get("news_catalysts", "") or ""))
+    research_summary = _clean_text_no_na(str(row.get("research_summary", "") or ""))
+
+    st.subheader("新闻催化与研报摘要")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown("**最新新闻催化**")
+        if news_catalysts:
+            st.text_area(
+                "news_catalysts",
+                value=news_catalysts,
+                height=180,
+                key=f"fnd_news_catalysts_{code}",
+            )
+        else:
+            st.info("暂无可用新闻催化（news_catalysts 为空）")
+    with c2:
+        st.markdown("**机构研报摘要**")
+        if research_summary:
+            st.text_area(
+                "research_summary",
+                value=research_summary,
+                height=180,
+                key=f"fnd_research_summary_{code}",
+            )
+        else:
+            st.info("暂无可用研报摘要（research_summary 为空）")
+
+    with st.expander("查看 DeepSeek 动态 Prompt（含催化剂插槽）", expanded=False):
+        dyn_prompt = _clean_text_no_na(str(row.get("fund_deepseek_prompt", "") or ""))
+        if dyn_prompt:
+            st.text_area(
+                "fund_deepseek_prompt",
+                value=dyn_prompt,
+                height=220,
+                key=f"fnd_dynamic_prompt_{code}",
+            )
+        else:
+            st.caption("当前行未生成动态 Prompt，回退使用 app 内默认提示词。")
+
+    st.divider()
     st.subheader("总结性文本")
     lines = _split_sentences(str(row.get("summary_text", "")))
     if lines:

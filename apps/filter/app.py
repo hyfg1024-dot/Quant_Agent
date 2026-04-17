@@ -32,6 +32,7 @@ from filter_engine import (
     refresh_market_snapshot,
     save_template,
 )
+from shared.db_manager import bulk_upsert_market_daily, init_duckdb, query_filter_results
 from shared.ui_shell import render_app_shell, render_section_intro, render_status_row
 
 st.set_page_config(page_title="大过滤器", page_icon="🧪", layout="wide")
@@ -79,6 +80,8 @@ def _save_local_prefs(username: str, api_key: str) -> None:
 
 if "flt_cfg" not in st.session_state:
     st.session_state["flt_cfg"] = default_filter_config()
+
+init_duckdb()
 if "flt_result" not in st.session_state:
     st.session_state["flt_result"] = None
 if "deepseek_user_input" not in st.session_state:
@@ -546,31 +549,62 @@ if run_now:
         st.error("还没有市场快照。请先在左侧点击“更新全市场数据”。")
     else:
         with st.spinner("正在执行筛选..."):
-            if two_stage:
-                stage1_cfg = _build_stage1_config(cfg)
-                p1, r1, m1, s1 = apply_filters(snap, stage1_cfg)
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+            bulk_upsert_market_daily(snap, trade_date=trade_date)
+            try:
+                if two_stage:
+                    stage1_cfg = _build_stage1_config(cfg)
+                    p1, r1, m1, s1 = query_filter_results(stage1_cfg, include_rearview=False)
 
-                if _has_rearview_enabled(cfg):
-                    stage2_cfg = _build_stage2_config(cfg)
-                    p2, r2, m2, _s2 = apply_filters(p1, stage2_cfg)
-                    passed_df = p2
-                    rejected_df = _concat_dedup(r1, r2)
-                    missing_df = _concat_dedup(m1, m2)
+                    if _has_rearview_enabled(cfg):
+                        stage2_cfg = _build_stage2_config(cfg)
+                        code_scope = p1["code"].dropna().astype(str).tolist() if ("code" in p1.columns) else []
+                        p2, r2, m2, _s2 = query_filter_results(stage2_cfg, source_codes=code_scope, include_rearview=True)
+                        passed_df = p2
+                        rejected_df = _concat_dedup(r1, r2)
+                        missing_df = _concat_dedup(m1, m2)
+                    else:
+                        passed_df, rejected_df, missing_df = p1, r1, m1
+
+                    stats = {
+                        "total": int(len(snap)),
+                        "passed": int(len(passed_df)),
+                        "rejected": int(len(rejected_df)),
+                        "missing": int(len(missing_df)),
+                        "stage1_passed": int(s1.get("passed", len(p1))),
+                        "stage2_passed": int(len(passed_df)),
+                        "stage_mode": "two",
+                    }
                 else:
-                    passed_df, rejected_df, missing_df = p1, r1, m1
+                    passed_df, rejected_df, missing_df, stats = query_filter_results(cfg, include_rearview=True)
+                    stats["stage_mode"] = "single"
+            except Exception as exc:
+                st.warning(f"DuckDB SQL筛选失败，已回退旧引擎：{type(exc).__name__}")
+                if two_stage:
+                    stage1_cfg = _build_stage1_config(cfg)
+                    p1, r1, m1, s1 = apply_filters(snap, stage1_cfg)
 
-                stats = {
-                    "total": int(len(snap)),
-                    "passed": int(len(passed_df)),
-                    "rejected": int(len(rejected_df)),
-                    "missing": int(len(missing_df)),
-                    "stage1_passed": int(s1.get("passed", len(p1))),
-                    "stage2_passed": int(len(passed_df)),
-                    "stage_mode": "two",
-                }
-            else:
-                passed_df, rejected_df, missing_df, stats = apply_filters(snap, cfg)
-                stats["stage_mode"] = "single"
+                    if _has_rearview_enabled(cfg):
+                        stage2_cfg = _build_stage2_config(cfg)
+                        p2, r2, m2, _s2 = apply_filters(p1, stage2_cfg)
+                        passed_df = p2
+                        rejected_df = _concat_dedup(r1, r2)
+                        missing_df = _concat_dedup(m1, m2)
+                    else:
+                        passed_df, rejected_df, missing_df = p1, r1, m1
+
+                    stats = {
+                        "total": int(len(snap)),
+                        "passed": int(len(passed_df)),
+                        "rejected": int(len(rejected_df)),
+                        "missing": int(len(missing_df)),
+                        "stage1_passed": int(s1.get("passed", len(p1))),
+                        "stage2_passed": int(len(passed_df)),
+                        "stage_mode": "two",
+                    }
+                else:
+                    passed_df, rejected_df, missing_df, stats = apply_filters(snap, cfg)
+                    stats["stage_mode"] = "single"
 
             st.session_state["flt_result"] = {
                 "passed": passed_df,

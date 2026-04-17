@@ -1,0 +1,56 @@
+{
+  "run_id": "pt_空AI",
+  "strategy_name": "V6_做空AI概念",
+  "config_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/strategies/空AI.yaml",
+  "universe_path": "/Users/wellthen/Desktop/Quant/Quant_System/apps/backtest/config/universe.yaml",
+  "created_at": "2026-04-11 13:29:17",
+  "last_update_date": "2026-04-10",
+  "initial_capital_hkd": 1100000.0,
+  "cash": 1212963.7365770629,
+  "shares": {
+    "0020.HK": -86000.0,
+    "0700.HK": 0.0,
+    "1357.HK": -22000.0,
+    "3690.HK": 1000.0,
+    "6682.HK": -3000.0,
+    "9999.HK": 1000.0
+  },
+  "entry_price": {
+    "0020.HK": 2.009999990463257,
+    "0700.HK": null,
+    "1357.HK": 4.320000171661377,
+    "3690.HK": 87.5999984741211,
+    "6682.HK": 37.560001373291016,
+    "9999.HK": 178.39999389648438
+  },
+  "prev_price": {
+    "0020.HK": 2.009999990463257,
+    "0700.HK": 504.5,
+    "1357.HK": 4.320000171661377,
+    "3690.HK": 87.5999984741211,
+    "6682.HK": 37.560001373291016,
+    "9999.HK": 178.39999389648438
+  },
+  "board_lots": {
+    "0020.HK": 1000,
+    "0700.HK": 1000,
+    "1357.HK": 1000,
+    "3690.HK": 1000,
+    "6682.HK": 1000,
+    "9999.HK": 1000
+  },
+  "short_enabled": {
+    "0020.HK": true,
+    "6682.HK": true,
+    "1357.HK": true
+  },
+  "costs": {
+    "trade_fee_total": 969.6981291482448,
+    "borrow_fee_total": 0.0
+  },
+  "flags": {
+    "terminated": false,
+    "long_stop_triggered": [],
+    "short_stop_triggered": []
+  }
+}

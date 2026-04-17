@@ -37,6 +37,11 @@ class ReportVisualizer:
         report_path = output_dir / f"report_{safe_name}_{ts}.html"
 
         nav_df = self._build_nav_df(result)
+        effective_end = pd.to_datetime(nav_df.index).max().date() if not nav_df.empty else None
+        stale_note = ""
+        if effective_end and effective_end < config.backtest.end_date:
+            stale_note = f"（请求截止 {config.backtest.end_date}，实际有效数据截止 {effective_end}）"
+
         fig_nav = self._fig_nav(nav_df, config)
         fig_heat = self._fig_monthly_heatmap(metrics.monthly_returns)
         fig_dd = self._fig_drawdown(nav_df)
@@ -91,6 +96,7 @@ class ReportVisualizer:
       <h1>{config.strategy_name}</h1>
       <div>{config.description or '-'}</div>
       <div class="muted">回测区间: {config.backtest.start_date} 至 {config.backtest.end_date} | 板块: {config.sector or '未指定'} | 报告时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+      <div class="muted">有效数据截止: {effective_end or '-'} {stale_note}</div>
       <div class="risk">风险提示：本报告回测基于历史数据和事后可得标的，存在后视偏差（look-ahead bias）和生存者偏差，结果不代表未来收益。</div>
     </div>
     {''.join(sections)}

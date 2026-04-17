@@ -1,0 +1,8 @@
+backup_time=2026-04-15 19:07:02 +0800
+git_head=424a52c
+git_branch=main
+tag_hint=baseline-20260415
+release_branch_hint=release/baseline-20260415
+main_version="QDB-20260327-FLT5Y-01"
+backtest_version="BT-20260411-01"
+paper_version="PT-20260411-01"

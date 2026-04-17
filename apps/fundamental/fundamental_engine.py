@@ -5,20 +5,312 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import akshare as ak
 import pandas as pd
 import requests
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover
+    st = None  # type: ignore[assignment]
 
 
-APP_VERSION = "FND-20260324-01"
+APP_VERSION = "FND-20260416-03"
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
 WATCHLIST_FILE = DATA_DIR / "watchlist.json"
+
+FUND_DEEPSEEK_PROMPT = """你是专业基本面分析师。请先基于财务与估值数据完成结构化研判，再结合事件催化进行短周期情绪判断。
+
+【最新新闻催化】
+{news_catalysts}
+
+【机构研报摘要】
+{research_summary}
+
+输出要求：
+1) 总结（不超过120字）
+2) 八维点评（每维1句）
+3) 关键风险（3条）
+4) 跟踪清单（3条）
+5) 结论：通过 / 观察 / 谨慎（给出理由）
+6) 催化剂研判（必须包含）：
+   - 请结合以上的最新新闻事件，判断目前的估值状态是否已被市场计价，
+   - 以及未来一周潜在的利好/利空情绪反应方向。
+要求：数据驱动、简洁、中文输出。"""
+
+
+def _cache_data(ttl: int = 3600):
+    def _decorator(func):
+        if st is None:
+            return func
+        return st.cache_data(ttl=ttl, show_spinner=False)(func)
+
+    return _decorator
+
+
+def _clean_text(value: Any, max_len: int = 120) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    return text[:max_len]
+
+
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> str:
+    if df is None or df.empty:
+        return ""
+    cols = {str(c).strip().lower(): str(c) for c in df.columns}
+    for cand in candidates:
+        hit = cols.get(cand.lower())
+        if hit:
+            return hit
+    return ""
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts)
+        text = str(value).strip()
+        if not text:
+            return None
+        dt = pd.to_datetime(text, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _to_bullets(items: List[str], prefix: str = "- ") -> str:
+    if not items:
+        return "- 暂无可用素材"
+    return "\n".join(f"{prefix}{x}" for x in items)
+
+
+def _build_stock_keywords(code: str, name: str) -> List[str]:
+    code_text = normalize_code(code)
+    keys: List[str] = []
+    if code_text:
+        keys.append(code_text)
+        keys.append(code_text.lstrip("0") or code_text)
+        if len(code_text) == 6:
+            keys.extend([f"SH{code_text}", f"SZ{code_text}"])
+        elif len(code_text) == 5:
+            keys.extend([f"{code_text}.HK", f"{code_text}HK"])
+    clean_name = _clean_text(name, max_len=32).replace(" ", "")
+    if clean_name:
+        keys.append(clean_name)
+    uniq: List[str] = []
+    for x in keys:
+        if x and x not in uniq:
+            uniq.append(x)
+    return uniq
+
+
+def _contains_keywords(text: str, keywords: List[str]) -> bool:
+    t = str(text or "")
+    if not t:
+        return False
+    for k in keywords:
+        if k and k in t:
+            return True
+    return False
+
+
+def build_fund_deepseek_prompt(news_catalysts: str, research_summary: str) -> str:
+    return FUND_DEEPSEEK_PROMPT.format(
+        news_catalysts=(news_catalysts or "暂无可用催化剂"),
+        research_summary=(research_summary or "暂无可用研报摘要"),
+    )
+
+
+@_cache_data(ttl=600)
+def _read_cls_telegraph() -> pd.DataFrame:
+    fn = getattr(ak, "stock_info_global_cls", None)
+    if fn is None:
+        return pd.DataFrame()
+    try:
+        df = retry_call(fn, max_retries=2)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@_cache_data(ttl=1200)
+def _read_em_stock_news(symbol: str) -> pd.DataFrame:
+    fn = getattr(ak, "stock_news_em", None)
+    if fn is None:
+        return pd.DataFrame()
+    try:
+        df = retry_call(lambda: fn(symbol=str(symbol)), max_retries=2)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@_cache_data(ttl=3600)
+def _read_em_research(symbol: str) -> pd.DataFrame:
+    fn = getattr(ak, "stock_research_report_em", None)
+    if fn is None:
+        return pd.DataFrame()
+    try:
+        df = retry_call(lambda: fn(symbol=str(symbol)), max_retries=2)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_news_research_context(code: str, name: str) -> Dict[str, Any]:
+    now = datetime.now()
+    start_3d = now - timedelta(days=3)
+    keywords = _build_stock_keywords(code, name)
+
+    telegraph_items: List[str] = []
+    news_items: List[str] = []
+    research_items: List[str] = []
+    warns: List[str] = []
+    details: Dict[str, Any] = {
+        "telegraph_total": 0,
+        "telegraph_matched": 0,
+        "news_total": 0,
+        "news_recent": 0,
+        "news_selected": 0,
+        "research_total": 0,
+        "research_selected": 0,
+    }
+
+    tele_df = _read_cls_telegraph()
+    if tele_df.empty:
+        warns.append("财联社电报: 接口返回为空或抓取失败")
+    else:
+        details["telegraph_total"] = int(len(tele_df))
+        t_time = _pick_col(tele_df, ["发布时间", "时间", "日期", "pub_time", "datetime"])
+        t_title = _pick_col(tele_df, ["标题", "title", "摘要"])
+        t_body = _pick_col(tele_df, ["内容", "正文", "快讯内容", "detail"])
+        for _, row in tele_df.iterrows():
+            title = _clean_text(row.get(t_title) if t_title else "", max_len=60)
+            body = _clean_text(row.get(t_body) if t_body else "", max_len=90)
+            merged = f"{title} {body}".strip()
+            if not merged:
+                continue
+            if keywords and not _contains_keywords(merged.replace(" ", ""), keywords):
+                continue
+            dt = _parse_dt(row.get(t_time) if t_time else None)
+            if dt is not None and dt.date() != now.date():
+                continue
+            details["telegraph_matched"] = int(details["telegraph_matched"]) + 1
+            stamp = dt.strftime("%H:%M") if dt else "--:--"
+            telegraph_items.append(f"{stamp} {title or body}")
+            if len(telegraph_items) >= 5:
+                break
+
+    news_df = _read_em_stock_news(code)
+    if news_df.empty:
+        warns.append("近3日个股新闻: 接口返回为空或抓取失败")
+    else:
+        details["news_total"] = int(len(news_df))
+        n_time = _pick_col(news_df, ["发布时间", "时间", "日期", "pub_time", "datetime"])
+        n_title = _pick_col(news_df, ["新闻标题", "标题", "title", "文章标题"])
+        n_src = _pick_col(news_df, ["文章来源", "来源", "媒体名称", "source"])
+        picked: List[Tuple[datetime, str]] = []
+        for _, row in news_df.iterrows():
+            title = _clean_text(row.get(n_title) if n_title else "", max_len=70)
+            if not title:
+                continue
+            dt = _parse_dt(row.get(n_time) if n_time else None)
+            if dt is not None and dt < start_3d:
+                continue
+            details["news_recent"] = int(details["news_recent"]) + 1
+            src = _clean_text(row.get(n_src) if n_src else "", max_len=14)
+            label = f"{dt.strftime('%m-%d %H:%M') if dt else '--'} {title}"
+            if src:
+                label += f" ({src})"
+            picked.append((dt or datetime(1970, 1, 1), label))
+        for _, item in sorted(picked, key=lambda x: x[0], reverse=True)[:6]:
+            news_items.append(item)
+        details["news_selected"] = int(len(news_items))
+
+    report_df = _read_em_research(code)
+    if report_df.empty:
+        warns.append("机构研报摘要: 接口返回为空或抓取失败")
+    else:
+        details["research_total"] = int(len(report_df))
+        r_time = _pick_col(report_df, ["日期", "发布时间", "报告日期", "publish_date"])
+        r_title = _pick_col(report_df, ["报告名称", "研报标题", "标题", "title"])
+        r_org = _pick_col(report_df, ["机构", "机构名称", "评级机构", "研究机构"])
+        r_rate = _pick_col(report_df, ["评级", "最新评级", "投资评级", "评级变动"])
+        r_sum = _pick_col(report_df, ["摘要", "报告摘要", "核心观点", "观点"])
+        picked_reports: List[Tuple[datetime, str]] = []
+        for _, row in report_df.iterrows():
+            title = _clean_text(row.get(r_title) if r_title else "", max_len=46)
+            summary = _clean_text(row.get(r_sum) if r_sum else "", max_len=66)
+            if not title and not summary:
+                continue
+            dt = _parse_dt(row.get(r_time) if r_time else None)
+            org = _clean_text(row.get(r_org) if r_org else "", max_len=16)
+            rate = _clean_text(row.get(r_rate) if r_rate else "", max_len=10)
+            head = " / ".join(x for x in [org, rate] if x)
+            core = summary or title
+            line = f"{dt.strftime('%Y-%m-%d') if dt else '--'}"
+            if head:
+                line += f" [{head}]"
+            line += f" {core}"
+            picked_reports.append((dt or datetime(1970, 1, 1), line))
+        for _, item in sorted(picked_reports, key=lambda x: x[0], reverse=True)[:2]:
+            research_items.append(item)
+        details["research_selected"] = int(len(research_items))
+
+    telegraph_lines = telegraph_items[:]
+    if not telegraph_lines:
+        if tele_df.empty:
+            telegraph_lines = ["财联社电报：接口返回为空或抓取失败"]
+        else:
+            telegraph_lines = [
+                f"当日未匹配到该股（扫描{details['telegraph_total']}条电报，匹配{details['telegraph_matched']}条）"
+            ]
+
+    news_lines = news_items[:]
+    if not news_lines:
+        if news_df.empty:
+            news_lines = ["个股新闻：接口返回为空或抓取失败"]
+        elif int(details["news_recent"]) == 0:
+            news_lines = [f"近3天时间窗内无新闻（原始{details['news_total']}条）"]
+        else:
+            news_lines = [f"有近3天新闻但筛选后为空（近3天{details['news_recent']}条）"]
+
+    research_lines = research_items[:]
+    if not research_lines:
+        if report_df.empty:
+            research_lines = ["机构研报：接口返回为空或抓取失败"]
+        else:
+            research_lines = [f"该股暂无可用研报摘要（原始{details['research_total']}篇）"]
+
+    news_catalysts = (
+        "【财联社电报（当日）】\n"
+        + _to_bullets(telegraph_lines)
+        + "\n【近3日核心新闻】\n"
+        + _to_bullets(news_lines)
+    )
+    research_summary = "【最近2篇机构研报摘要】\n" + _to_bullets(research_lines)
+    return {
+        "telegraph_items": telegraph_items,
+        "news_items": news_items,
+        "research_items": research_items,
+        "news_catalysts": news_catalysts,
+        "research_summary": research_summary,
+        "warns": warns,
+        "details": details,
+    }
 
 
 DEFAULT_WATCHLIST = [
@@ -311,6 +603,7 @@ def _latest_annual_columns(df: pd.DataFrame, n: int = 6) -> List[str]:
     return cols[:n]
 
 
+@_cache_data(ttl=3600)
 def _read_abstract(symbol: str) -> pd.DataFrame:
     def _fetch():
         return ak.stock_financial_abstract(symbol=symbol)
@@ -318,6 +611,7 @@ def _read_abstract(symbol: str) -> pd.DataFrame:
     return retry_call(_fetch)
 
 
+@_cache_data(ttl=3600)
 def _read_annual_indicator(symbol: str) -> pd.DataFrame:
     def _fetch():
         return ak.stock_financial_abstract_ths(symbol=symbol, indicator="按年度")
@@ -325,6 +619,7 @@ def _read_annual_indicator(symbol: str) -> pd.DataFrame:
     return retry_call(_fetch)
 
 
+@_cache_data(ttl=3600)
 def _read_profile(symbol: str) -> Optional[Dict[str, Any]]:
     def _fetch():
         return ak.stock_individual_info_em(symbol=symbol)
@@ -913,6 +1208,17 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     ocf_positive_years_5y = int(_coalesce_number(ocf_positive_years_5y, stale_cache.get("ocf_positive_years_5y"), default=0) or 0)
     goodwill_ratio_pct = _coalesce_number(goodwill_ratio_pct, stale_cache.get("goodwill_ratio_pct"))
 
+    catalyst_ctx = _fetch_news_research_context(code, result.get("name", name or code))
+    news_catalysts = str(catalyst_ctx.get("news_catalysts") or "").strip()
+    research_summary = str(catalyst_ctx.get("research_summary") or "").strip()
+    if not news_catalysts:
+        news_catalysts = str(stale_cache.get("news_catalysts", "")).strip() or "暂无可用催化剂"
+    if not research_summary:
+        research_summary = str(stale_cache.get("research_summary", "")).strip() or "暂无可用研报摘要"
+    for warn in catalyst_ctx.get("warns", []):
+        if warn and warn not in data_warnings:
+            data_warnings.append(str(warn))
+
     if pe_dynamic is None:
         data_warnings.append("PE(动) 暂不可用")
     if pe_static is None:
@@ -996,6 +1302,13 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
                 for d in dimensions
             ],
             "summary_text": _build_summary(code, result["name"], total_score, conclusion, dimensions),
+            "news_catalysts": news_catalysts,
+            "research_summary": research_summary,
+            "telegraph_items": catalyst_ctx.get("telegraph_items", []),
+            "news_items": catalyst_ctx.get("news_items", []),
+            "research_items": catalyst_ctx.get("research_items", []),
+            "news_fetch_details": catalyst_ctx.get("details", {}),
+            "fund_deepseek_prompt": build_fund_deepseek_prompt(news_catalysts, research_summary),
             "data_warnings": data_warnings,
         }
     )

@@ -1,0 +1,67 @@
+[
+  {
+    "ts": "2026-04-11 12:01:56",
+    "date": "2026-04-10",
+    "code": "1109.HK",
+    "action": "BUY",
+    "delta_shares": 6000.0,
+    "target_shares": 6000.0,
+    "board_lot": 2000,
+    "price": 29.449420076370235,
+    "notional": 176696.5204582214,
+    "fee": 265.0447806873321,
+    "reason": "init"
+  },
+  {
+    "ts": "2026-04-11 12:01:56",
+    "date": "2026-04-10",
+    "code": "0688.HK",
+    "action": "BUY",
+    "delta_shares": 15000.0,
+    "target_shares": 15000.0,
+    "board_lot": 1000,
+    "price": 11.941930305480954,
+    "notional": 179128.9545822143,
+    "fee": 268.69343187332146,
+    "reason": "init"
+  },
+  {
+    "ts": "2026-04-11 12:01:56",
+    "date": "2026-04-10",
+    "code": "0960.HK",
+    "action": "BUY",
+    "delta_shares": 21000.0,
+    "target_shares": 21000.0,
+    "board_lot": 1000,
+    "price": 7.687679828166961,
+    "notional": 161441.27639150617,
+    "fee": 242.16191458725925,
+    "reason": "init"
+  },
+  {
+    "ts": "2026-04-11 12:01:56",
+    "date": "2026-04-10",
+    "code": "2007.HK",
+    "action": "SHORT",
+    "delta_shares": -436000.0,
+    "target_shares": -436000.0,
+    "board_lot": 1000,
+    "price": 0.3046950071454048,
+    "notional": 132847.0231153965,
+    "fee": 199.27053467309474,
+    "reason": "init"
+  },
+  {
+    "ts": "2026-04-11 12:01:56",
+    "date": "2026-04-10",
+    "code": "1918.HK",
+    "action": "SHORT",
+    "delta_shares": -104000.0,
+    "target_shares": -104000.0,
+    "board_lot": 1000,
+    "price": 1.038959961891174,
+    "notional": 108051.8360366821,
+    "fee": 162.07775405502315,
+    "reason": "init"
+  }
+]

@@ -1,0 +1,89 @@
+# ============================================
+# 策略V6：做空AI概念泡沫
+# 做多真盈利科技 + 做空AI烧钱概念
+# ============================================
+
+strategy_name: "V6_做空AI概念"
+description: "做多有真实盈利的科技龙头，做空靠AI叙事撑估值的亏损概念股"
+sector: ""
+
+backtest:
+  start_date: "2023-07-01"   # 商汤/第四范式等AI股的炒作起点
+  end_date: "today"
+
+capital:
+  total: 1000000
+  rmb_to_hkd_rate: 1.1
+  long_pct: 0.55             # 多头略多于空头
+  short_pct: 0.35            # 空头重一些 — 这是做空主题策略
+  cash_buffer_pct: 0.10
+
+# === 多头：真赚钱的科技（对冲用） ===
+long_positions:
+  - code: "0700.HK"          # 腾讯控股
+    weight: 0.40
+    # 理由：港股科技绝对龙头
+    # 游戏+社交+云+金融科技，全线盈利
+    # 每年千亿回购 = 隐性高分红
+    # AI浪潮中的真正受益者（混元大模型已商业化）
+    # 如果AI退潮，腾讯靠游戏/广告照样赚钱
+
+  - code: "9999.HK"          # 网易
+    weight: 0.35
+    # 理由：游戏行业利润率最高的公司之一
+    # 不讲AI故事，靠产品赚钱
+    # 估值便宜（PE ~15x），高分红
+    # 与AI叙事无关 = 天然对冲
+
+  - code: "3690.HK"          # 美团
+    weight: 0.25
+    # 理由：本地生活垄断，已转正盈利
+    # AI用于配送优化是真落地（不是概念）
+    # 估值经过充分调整
+
+# === 空头：AI概念烧钱股 ===
+short_positions:
+  - code: "0020.HK"          # 商汤
+    weight: 0.45
+    # 做空核心标的
+    # 上市以来持续巨额亏损，累计亏损超400亿
+    # 收入高度依赖政府智慧城市项目（政策风险）
+    # "生成式AI"概念炒了一轮但营收未兑现
+    # 限售股持续解禁，大股东减持压力大
+    # 行业共识：如果AI泡沫破，商汤首当其冲
+
+  - code: "6682.HK"          # 第四范式
+    weight: 0.30
+    # 企业级AI平台，估值高但盈利遥遥无期
+    # 客户集中度高，大单依赖
+    # 每年亏损扩大，现金流持续为负
+    # 如果企业AI预算收缩，直接冲击收入
+
+  - code: "1357.HK"          # 美图公司
+    weight: 0.25
+    # 从"美颜工具"硬转型"AI公司"
+    # AI相关收入占比实际很低
+    # 股价因AI叙事已涨了一大波
+    # 一旦市场回归理性，溢价会快速消失
+
+weighting_mode: "manual"
+
+rebalance:
+  frequency: "monthly"
+  day: 1
+
+costs:
+  commission_rate: 0.0015
+  slippage: 0.001
+  short_borrow_rate: 0.12    # AI小盘股融券费率偏高
+
+stop_loss:
+  single_long_stop: -0.20
+  single_long_action: "halve"
+  single_short_stop: 0.35    # AI股波动极大，留足缓冲
+  single_short_action: "close"
+  portfolio_stop: -0.15
+  portfolio_action: "close_all"
+
+sensitivity:
+  borrow_rates: [0.05, 0.08, 0.12, 0.18, 0.25]

@@ -469,15 +469,29 @@ def run_backtrader_backtest(
     logger=print,
     board_lot_overrides: Optional[Dict[str, int]] = None,
     volume_fill_pct: float = 0.2,
+    prepared_input: Optional[PreparedInput] = None,
 ) -> BacktestResult:
     """Run one backtest via Backtrader and return legacy-compatible result."""
-    prepared = _prepare_inputs(
+    prepared = prepared_input or _prepare_inputs(
         config=config,
         data_manager=data_manager,
         benchmark_codes=benchmark_codes or ["^HSI"],
         logger=logger,
         board_lot_overrides=board_lot_overrides,
     )
+    return _run_backtrader_with_prepared(
+        config=config,
+        prepared=prepared,
+        volume_fill_pct=volume_fill_pct,
+    )
+
+
+def _run_backtrader_with_prepared(
+    config: StrategyConfig,
+    prepared: PreparedInput,
+    volume_fill_pct: float,
+) -> BacktestResult:
+    """Run one backtest using preloaded/aligned data."""
 
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.broker.setcash(float(config.capital.total_hkd))
@@ -564,8 +578,17 @@ def run_backtrader_sensitivity(
     logger=print,
     board_lot_overrides: Optional[Dict[str, int]] = None,
     volume_fill_pct: float = 0.2,
+    prepared_input: Optional[PreparedInput] = None,
 ) -> pd.DataFrame:
     """Run borrow-rate sensitivity with Backtrader engine."""
+    prepared = prepared_input or _prepare_inputs(
+        config=config,
+        data_manager=data_manager,
+        benchmark_codes=benchmark_codes or ["^HSI"],
+        logger=logger,
+        board_lot_overrides=board_lot_overrides,
+    )
+
     rows: List[Dict[str, Any]] = []
     for rate in borrow_rates:
         cfg = copy.deepcopy(config)
@@ -577,6 +600,7 @@ def run_backtrader_sensitivity(
             logger=lambda *_args, **_kwargs: None,
             board_lot_overrides=board_lot_overrides,
             volume_fill_pct=volume_fill_pct,
+            prepared_input=prepared,
         )
         s = pd.to_numeric(result.daily_portfolio_value, errors="coerce").dropna()
         if s.empty:
@@ -593,6 +617,23 @@ def run_backtrader_sensitivity(
     if not rows:
         return pd.DataFrame(columns=["borrow_rate", "final_value", "cumulative_return", "total_cost", "borrow_cost"])
     return pd.DataFrame(rows).sort_values("borrow_rate").reset_index(drop=True)
+
+
+def prepare_backtrader_input(
+    config: StrategyConfig,
+    data_manager: DataManager,
+    benchmark_codes: Optional[List[str]] = None,
+    logger=print,
+    board_lot_overrides: Optional[Dict[str, int]] = None,
+) -> PreparedInput:
+    """Prepare and cache aligned inputs for main run and sensitivity reuse."""
+    return _prepare_inputs(
+        config=config,
+        data_manager=data_manager,
+        benchmark_codes=benchmark_codes or ["^HSI"],
+        logger=logger,
+        board_lot_overrides=board_lot_overrides,
+    )
 
 
 def _prepare_inputs(
