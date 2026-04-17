@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
-from typing import Sequence
+from typing import Any, Dict, Sequence
 
 import streamlit as st
 import streamlit.components.v1 as components
+
+from shared.market_sentiment import MarketSentimentEngine
 
 
 @dataclass(frozen=True)
@@ -91,9 +93,130 @@ _SHELLS: dict[str, ShellMeta] = {
             ("工作方式", "逐日执行与复盘"),
         ),
     ),
+    "portfolio": ShellMeta(
+        label="Portfolio Guard",
+        nav_title="仓位风控",
+        title="仓位与风控台",
+        subtitle="围绕真实仓位做统一视图：持仓分布、浮动盈亏与 ATR 风险头寸建议，提升执行一致性。",
+        accent="#5a8dee",
+        accent_soft="#bfd8ff",
+        glow="rgba(90, 141, 238, 0.24)",
+        metrics=(
+            ("主视角", "仓位风险"),
+            ("信息层级", "仓位 + PnL + 建议"),
+            ("工作方式", "录入 -> 监控 -> 调整"),
+        ),
+    ),
 }
 
-_NAV_ORDER = ("filter", "fundamental", "trading", "backtest", "paper")
+_NAV_ORDER = ("filter", "fundamental", "trading", "backtest", "paper", "portfolio")
+_MARKET_SENTIMENT_ENGINE = MarketSentimentEngine()
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _get_market_sentiment_snapshot() -> Dict[str, Any]:
+    try:
+        return _MARKET_SENTIMENT_ENGINE.get_snapshot().to_dict()
+    except Exception as exc:
+        return {
+            "score": 50.0,
+            "state": "neutral",
+            "state_text": "中性",
+            "message": "情绪数据暂不可用，已回退中性口径。",
+            "warning_banner": "",
+            "up_count": 0,
+            "down_count": 0,
+            "adl": 0,
+            "flow_value_yi": 0.0,
+            "flow_source": "fallback",
+            "limit_up_counts_3d": [0, 0, 0],
+            "board_heights_3d": [0, 0, 0],
+            "limit_up_avg_3d": 0.0,
+            "max_board_3d": 0,
+            "updated_at": "",
+            "fetch_error": str(exc),
+        }
+
+
+def _render_market_sentiment_bar() -> None:
+    snap = _get_market_sentiment_snapshot()
+    score = float(snap.get("score", 50.0) or 50.0)
+    state = str(snap.get("state", "neutral") or "neutral")
+    state_text = str(snap.get("state_text", "中性") or "中性")
+    up_count = int(snap.get("up_count", 0) or 0)
+    down_count = int(snap.get("down_count", 0) or 0)
+    adl = int(snap.get("adl", 0) or 0)
+    flow_value = float(snap.get("flow_value_yi", 0.0) or 0.0)
+    flow_source = str(snap.get("flow_source", "fallback") or "fallback")
+    limit_ups = snap.get("limit_up_counts_3d", []) or [0, 0, 0]
+    boards = snap.get("board_heights_3d", []) or [0, 0, 0]
+    updated_at = str(snap.get("updated_at", "") or "")
+    fetch_error = str(snap.get("fetch_error", "") or "")
+    has_breadth_data = (up_count + down_count) > 0
+    flow_delta_map = {
+        "northbound": "北向口径",
+        "industry_flow": "行业口径",
+        "fallback": "回退口径",
+        "unavailable": "不可用",
+    }
+    flow_delta = flow_delta_map.get(flow_source, flow_source)
+
+    if score > 70:
+        delta = "过热"
+        banner_text = str(snap.get("message", "市场情绪偏热，追涨风险上升。") or "")
+        badge_html = "<span class='qs-sentiment-badge heat'>过热警示</span>"
+        banner_class = "overheat"
+    elif score < 30:
+        delta = "冰点/恐慌"
+        banner_text = str(
+            snap.get(
+                "warning_banner",
+                "当前大盘极度弱势或恐慌，系统建议强制降低预警个股 50% 的建议买入仓位。",
+            )
+            or ""
+        )
+        badge_html = "<span class='qs-sentiment-badge panic'>系统强预警</span>"
+        banner_class = "panic"
+    else:
+        delta = "中性"
+        banner_text = str(snap.get("message", "市场情绪中性，建议结构化应对。") or "")
+        badge_html = ""
+        banner_class = "neutral"
+
+    c1, c2, c3, c4 = st.columns([1.15, 1.0, 0.8, 1.05], vertical_alignment="center")
+    with c1:
+        st.metric("Market Sentiment Score", f"{score:.1f}/100", delta=delta)
+    with c2:
+        st.metric("上涨 / 下跌", f"{up_count} / {down_count}" if has_breadth_data else "— / —")
+    with c3:
+        st.metric("ADL", f"{adl:+d}" if has_breadth_data else "—")
+    with c4:
+        st.metric("资金净流入(亿)", f"{flow_value:,.1f}", delta=flow_delta)
+
+    limit_text = "/".join(str(int(x)) for x in limit_ups[:3])
+    board_text = "/".join(str(int(x)) for x in boards[:3])
+    subtitle = f"近3日涨停家数 {limit_text} ｜ 连板高度 {board_text} ｜ 更新时间 {escape(updated_at or '-')}"
+
+    st.markdown(
+        (
+            f"<section class='qs-sentiment-wrap'>"
+            f"<div class='qs-sentiment-banner {banner_class}'>"
+            f"<div class='qs-sentiment-row'>"
+            f"<span class='qs-sentiment-title'>大盘情绪监测：{escape(state_text)}（{score:.1f}/100）</span>"
+            f"{badge_html}"
+            f"</div>"
+            f"<div class='qs-sentiment-text'>{escape(banner_text)}</div>"
+            f"<div class='qs-sentiment-sub'>{escape(subtitle)}</div>"
+            f"</div>"
+            f"</section>"
+        ),
+        unsafe_allow_html=True,
+    )
+    if fetch_error:
+        short_err = fetch_error if len(fetch_error) <= 140 else f"{fetch_error[:140]}..."
+        st.caption(f"情绪数据回退说明: {short_err}")
+        with st.expander("查看完整回退日志", expanded=False):
+            st.code(fetch_error)
 
 
 def _shell_style(meta: ShellMeta, active_page: str) -> str:
@@ -423,6 +546,73 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
     .qs-top-nav-reserve {{
       height: 5.8rem;
     }}
+    .qs-sentiment-wrap {{
+      margin: 0.35rem 0 1rem 0;
+    }}
+    .qs-sentiment-banner {{
+      border-radius: 18px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      padding: 0.78rem 0.95rem 0.85rem;
+      box-shadow: 0 10px 22px rgba(0, 0, 0, 0.16);
+      backdrop-filter: blur(8px);
+    }}
+    .qs-sentiment-banner.neutral {{
+      background: linear-gradient(145deg, rgba(82, 147, 210, 0.22), rgba(62, 107, 173, 0.2));
+      border-color: rgba(114, 168, 221, 0.42);
+    }}
+    .qs-sentiment-banner.overheat {{
+      background: linear-gradient(145deg, rgba(206, 78, 78, 0.32), rgba(170, 45, 45, 0.25));
+      border-color: rgba(235, 123, 123, 0.56);
+    }}
+    .qs-sentiment-banner.panic {{
+      background: linear-gradient(145deg, rgba(190, 44, 44, 0.56), rgba(144, 17, 17, 0.48));
+      border-color: rgba(255, 145, 145, 0.8);
+      box-shadow: 0 0 0 1px rgba(255, 127, 127, 0.25), 0 14px 28px rgba(0, 0, 0, 0.24);
+    }}
+    .qs-sentiment-row {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.7rem;
+      flex-wrap: wrap;
+    }}
+    .qs-sentiment-title {{
+      font-size: 1.04rem;
+      font-weight: 800;
+      color: rgba(255, 247, 240, 0.98);
+    }}
+    .qs-sentiment-badge {{
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 800;
+      padding: 0.24rem 0.65rem;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }}
+    .qs-sentiment-badge.heat {{
+      background: rgba(241, 120, 120, 0.3);
+      color: #ffd6d6;
+      border-color: rgba(253, 170, 170, 0.62);
+    }}
+    .qs-sentiment-badge.panic {{
+      background: rgba(255, 106, 106, 0.42);
+      color: #ffe8e8;
+      border-color: rgba(255, 185, 185, 0.76);
+    }}
+    .qs-sentiment-text {{
+      margin-top: 0.38rem;
+      font-size: 0.98rem;
+      font-weight: 700;
+      color: rgba(255, 239, 233, 0.96);
+      line-height: 1.55;
+    }}
+    .qs-sentiment-sub {{
+      margin-top: 0.3rem;
+      font-size: 0.84rem;
+      color: rgba(244, 229, 220, 0.82);
+      letter-spacing: 0.01em;
+    }}
     .st-key-qs_top_nav_row {{
       position: relative;
       z-index: 60;
@@ -494,6 +684,11 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
       background:
         linear-gradient(180deg, rgba(209, 67, 67, 0.99), rgba(209, 67, 67, 0.99)) !important;
       border-color: rgba(209, 67, 67, 0.86) !important;
+    }}
+    .st-key-qs_top_nav_portfolio div.stButton > button {{
+      background:
+        linear-gradient(180deg, rgba(90, 141, 238, 0.99), rgba(90, 141, 238, 0.99)) !important;
+      border-color: rgba(90, 141, 238, 0.86) !important;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button:hover {{
       opacity: 1;
@@ -971,7 +1166,6 @@ def render_app_shell(
         for label, value in card_metrics
     )
     shell_html = f"""
-    {_shell_style(meta, active_page)}
     <section class="qs-hero">
       <div class="qs-hero-grid">
         <div>
@@ -989,6 +1183,8 @@ def render_app_shell(
       </div>
     </section>
     """
+    st.markdown(_shell_style(meta, active_page), unsafe_allow_html=True)
+    _render_market_sentiment_bar()
     st.markdown(shell_html, unsafe_allow_html=True)
 
 

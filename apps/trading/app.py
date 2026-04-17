@@ -1,6 +1,9 @@
 import base64
+import asyncio
+import concurrent.futures
 import copy
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -46,7 +49,7 @@ except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
     class RateLimitError(Exception):
         pass
 
-from fast_engine import fetch_fast_panel
+from fast_engine import _get_data_provider, fetch_fast_panel
 from slow_engine import (
     add_stock_by_query,
     fetch_live_valuation_snapshot,
@@ -82,9 +85,11 @@ from filter_engine import (
     DISPLAY_COLUMNS as FILTER_DISPLAY_COLUMNS,
     apply_filters as filter_apply_filters,
     build_ai_quick_config as filter_build_ai_quick_config,
+    check_market_data_dns as filter_check_market_data_dns,
     default_filter_config as filter_default_filter_config,
     export_snapshot_health_excel as filter_export_snapshot_health_excel,
     export_results_excel as filter_export_results_excel,
+    get_baseline_build_progress as filter_get_baseline_build_progress,
     get_snapshot_health_report as filter_get_snapshot_health_report,
     get_snapshot_meta as filter_get_snapshot_meta,
     get_template_config as filter_get_template_config,
@@ -92,20 +97,24 @@ from filter_engine import (
     load_snapshot as filter_load_snapshot,
     load_templates as filter_load_templates,
     refresh_market_snapshot as filter_refresh_market_snapshot,
+    run_baseline_build_once as filter_run_baseline_build_once,
     save_template as filter_save_template,
 )
+from shared.multi_agent_analyzer import MultiAgentAnalyzer
 from shared.ui_shell import render_app_shell, render_section_intro, render_status_row, render_top_nav
 
 st.set_page_config(page_title="Quant Dashboard", page_icon="📊", layout="wide")
 APP_VERSION = "QDB-20260327-FLT5Y-01"
 BACKTEST_APP_VERSION = "BT-20260411-01"
 PAPER_APP_VERSION = "PT-20260411-01"
+PORTFOLIO_APP_VERSION = "PF-20260416-01"
 LOCAL_PREFS_PATH = "data/local_user_prefs.json"
 ANALYSIS_CACHE_PATH = "data/deepseek_analysis_cache.json"
 ANALYSIS_JOB_DIR = "data/analysis_jobs"
 ANALYSIS_DELTA_CACHE_PATH = "data/deepseek_delta_cache.json"
 ANALYSIS_COOLDOWN_PATH = "data/deepseek_cooldown.json"
 DEEP_COOLDOWN_MINUTES = 5
+ANALYSIS_ENGINE_VERSION = "multi_agent_v1"
 BACKTEST_DIR = CURRENT_DIR.parent / "backtest"
 BACKTEST_RUNNER = BACKTEST_DIR / "run_backtest.py"
 BACKTEST_PAPER_RUNNER = BACKTEST_DIR / "paper_trade.py"
@@ -154,6 +163,8 @@ FUND_DEEPSEEK_PROMPT = """你是专业基本面分析师。基于输入 JSON 做
 4) 跟踪清单（3条）
 5) 结论：通过 / 观察 / 谨慎（给出理由）
 要求：数据驱动、简洁、中文输出。"""
+
+MULTI_AGENT_ANALYZER = MultiAgentAnalyzer()
 
 
 def _load_local_prefs() -> dict:
@@ -708,7 +719,7 @@ if _curr_user != _last.get("deepseek_user", "") or _curr_key != _last.get("deeps
         "deepseek_api_key": _curr_key,
     }
 
-_allowed_pages = {"trading", "fundamental", "filter", "backtest", "paper"}
+_allowed_pages = {"trading", "fundamental", "filter", "backtest", "paper", "portfolio"}
 try:
     _qp_page = str(st.query_params.get("page", "")).strip().lower()
 except Exception:
@@ -744,6 +755,7 @@ render_app_shell(
         "filter": FILTER_APP_VERSION,
         "backtest": BACKTEST_APP_VERSION,
         "paper": PAPER_APP_VERSION,
+        "portfolio": PORTFOLIO_APP_VERSION,
     }.get(_active_page, APP_VERSION),
     badges={
         "fundamental": ("八维评分", "观察名单", "结构化结论"),
@@ -751,6 +763,7 @@ render_app_shell(
         "filter": ("两段筛选", "快照更新", "结果导出"),
         "backtest": ("多空回测", "成本建模", "HTML报告"),
         "paper": ("策略入口", "逐日更新", "模拟看板"),
+        "portfolio": ("仓位管理", "浮动盈亏", "ATR风控"),
     }.get(_active_page, ("实时盘口", "分时结构", "DeepSeek 分析")),
     metrics={
         "fundamental": (
@@ -777,6 +790,11 @@ render_app_shell(
             ("执行模式", "逐日模拟"),
             ("交易日口径", "港股实际交易日"),
             ("工作流", "启动 -> 更新 -> 看板"),
+        ),
+        "portfolio": (
+            ("执行模式", "真实仓位"),
+            ("风险口径", "单笔风险 1%"),
+            ("工作流", "录入 -> 监控 -> 调整"),
         ),
     }.get(
         _active_page,
@@ -1134,14 +1152,46 @@ def _call_deepseek_with_prompt(
     return report, usage_dict, cost, elapsed
 
 
+def _run_async_blocking(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None or (not loop.is_running()):
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(lambda: asyncio.run(coro))
+        return fut.result()
+
+
+def _call_multi_agent_analysis(json_text: str) -> tuple[str, dict, float, float]:
+    def _llm_call(
+        user_content: str,
+        system_prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> tuple[str, dict, float, float]:
+        return _call_deepseek_with_prompt(
+            user_content=user_content,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+    result = _run_async_blocking(MULTI_AGENT_ANALYZER.analyze(user_content=json_text, llm_call=_llm_call))
+    report = str(result.get("final_text", "") or "").strip()
+    usage = result.get("usage", {}) if isinstance(result.get("usage"), dict) else {}
+    if isinstance(usage, dict):
+        usage["_multi_agent_meta"] = result.get("meta", {}) if isinstance(result.get("meta"), dict) else {}
+    total_cost = float(result.get("total_cost", 0.0) or 0.0)
+    elapsed = float(result.get("elapsed", 0.0) or 0.0)
+    return report, usage, total_cost, elapsed
+
+
 def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
-    return _call_deepseek_with_prompt(
-        user_content=json_text,
-        system_prompt=DEEPSEEK_SYSTEM_PROMPT,
-        max_tokens=1500,
-        temperature=0.3,
-        top_p=0.9,
-    )
+    return _call_multi_agent_analysis(json_text=json_text)
 
 
 def _sanitize_deepseek_report(text: str) -> str:
@@ -1217,6 +1267,40 @@ def _format_card_desc_lines(text: str, max_lines: int = 3) -> str:
     return "".join(html_lines)
 
 
+def _clean_text_keep_lines(text: str) -> str:
+    s = str(text or "")
+    for bad in ["N/A", "n/a", "nan", "None", "null"]:
+        s = s.replace(bad, "")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", x).strip() for x in s.split("\n")]
+    lines = [x for x in lines if x]
+    return "\n".join(lines).strip()
+
+
+def _format_rag_text_block(text: str) -> str:
+    raw = _clean_text_keep_lines(text)
+    if not raw:
+        return ""
+    s = raw
+    s = s.replace("】-", "】\n- ").replace("）-", "）\n- ")
+    s = re.sub(r"\s+【", "\n【", s)
+    s = re.sub(r"\s*-\s*(?=(\d{2}-\d{2}\s\d{2}:\d{2}|\d{4}-\d{2}-\d{2}|\[\d{4}-\d{2}-\d{2}\]))", "\n- ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _format_prompt_text_block(text: str) -> str:
+    raw = _clean_text_keep_lines(text)
+    if not raw:
+        return ""
+    s = raw
+    for marker in ["【最新新闻催化】", "【机构研报摘要】", "输出要求：", "6) 催化剂研判（必须包含）：", "要求："]:
+        s = s.replace(marker, f"\n{marker}")
+    s = re.sub(r"\s*-\s*", "\n- ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def _shared_watchlist_rows():
     pool_rows = get_stock_pool()
     group_map = get_stock_group_map()
@@ -1232,6 +1316,17 @@ def _shared_watchlist_rows():
     return out
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_analyze_watchlist_rows(watchlist_payload: str) -> list:
+    try:
+        watchlist = json.loads(watchlist_payload)
+    except Exception:
+        watchlist = []
+    if not isinstance(watchlist, list):
+        watchlist = []
+    return analyze_fundamental_watchlist(watchlist, force_refresh=False)
+
+
 def _ensure_fundamental_state(force_refresh: bool = False):
     if "fnd_deepseek_reports" not in st.session_state:
         st.session_state["fnd_deepseek_reports"] = {}
@@ -1245,7 +1340,10 @@ def _ensure_fundamental_state(force_refresh: bool = False):
         or st.session_state.get("fnd_watchlist_hash", "") != wl_hash
     )
     if stale:
-        st.session_state["fnd_rows"] = analyze_fundamental_watchlist(watchlist, force_refresh=force_refresh)
+        if force_refresh:
+            st.session_state["fnd_rows"] = analyze_fundamental_watchlist(watchlist, force_refresh=True)
+        else:
+            st.session_state["fnd_rows"] = _cached_analyze_watchlist_rows(hash_text)
         st.session_state["fnd_watchlist_hash"] = wl_hash
         if st.session_state["fnd_rows"]:
             valid_codes = {str(x.get("code", "")) for x in st.session_state["fnd_rows"]}
@@ -1375,6 +1473,47 @@ def _render_fundamental_page():
         kicker="Narrative",
         pills=("总结文本", "复制 JSON", "DeepSeek 深挖"),
     )
+
+    news_catalysts = _format_rag_text_block(str(row.get("news_catalysts", "") or ""))
+    research_summary = _format_rag_text_block(str(row.get("research_summary", "") or ""))
+    st.subheader("新闻催化与研报摘要")
+    ns1, ns2 = st.columns(2, gap="large")
+    with ns1:
+        st.markdown("**最新新闻催化**")
+        if news_catalysts:
+            st.text_area(
+                "news_catalysts",
+                value=news_catalysts,
+                height=220,
+                key=f"tr_fnd_news_catalysts_{row.get('code', '')}",
+            )
+        else:
+            st.info("当前标的暂无 news_catalysts（请点侧栏“刷新全部”后再看）")
+    with ns2:
+        st.markdown("**机构研报摘要**")
+        if research_summary:
+            st.text_area(
+                "research_summary",
+                value=research_summary,
+                height=220,
+                key=f"tr_fnd_research_summary_{row.get('code', '')}",
+            )
+        else:
+            st.info("当前标的暂无 research_summary（请点侧栏“刷新全部”后再看）")
+
+    with st.expander("查看动态 Prompt（含 news_catalysts/research_summary）", expanded=False):
+        dyn_prompt = _format_prompt_text_block(str(row.get("fund_deepseek_prompt", "") or ""))
+        if dyn_prompt:
+            st.text_area(
+                "fund_deepseek_prompt",
+                value=dyn_prompt,
+                height=280,
+                key=f"tr_fnd_dyn_prompt_{row.get('code', '')}",
+            )
+        else:
+            st.caption("当前缓存行未生成动态 Prompt。")
+
+    st.divider()
     st.subheader("总结性文本")
     lines = _split_sentences(str(row.get("summary_text", "")))
     if lines:
@@ -1540,6 +1679,14 @@ def _render_filter_ops_panel() -> None:
     safe_mode = c4.checkbox("安全模式（防封）", value=True, key="flt_ops_safe_mode")
     rotate_enrich = st.checkbox("深度补充采用轮转增量（推荐）", value=True, key="flt_ops_rotate")
     force_refresh = st.checkbox("忽略缓存强制重抓", value=False, key="flt_ops_force")
+    bootstrap_batch = st.number_input(
+        "首轮建库每次推进数量（A股，断点续跑）",
+        min_value=100,
+        max_value=2000,
+        value=800,
+        step=100,
+        key="flt_ops_bootstrap_batch",
+    )
 
     weekly = filter_get_weekly_update_status("AH")
     weekly_state = "已到期可执行" if bool(weekly.get("due")) else f"未到期（剩余{float(weekly.get('remaining_hours', 0.0)):.1f}小时）"
@@ -1547,7 +1694,7 @@ def _render_filter_ops_panel() -> None:
         f"周更(A+H)上次: {weekly.get('last') or '--'} ｜ 下次到期: {weekly.get('next_due') or '立即可执行'} ｜ 当前状态: {weekly_state}"
     )
 
-    u1, u2 = st.columns(2)
+    u1, u2, u3, u4 = st.columns(4)
     if u1.button("运行一次更新（运维台）", use_container_width=True, key="flt_ops_run_once"):
         with st.spinner("正在执行运维更新..."):
             try:
@@ -1594,6 +1741,53 @@ def _render_filter_ops_panel() -> None:
                 st.session_state["flt_result"] = None
             except Exception as exc:
                 st.error(f"周更失败: {exc}")
+
+    if u3.button("首轮建库推进（断点续跑）", use_container_width=True, key="flt_ops_bootstrap_once"):
+        with st.spinner("正在推进首轮建库..."):
+            try:
+                result = filter_run_baseline_build_once(
+                    market_scope="AH",
+                    enrich_batch=int(bootstrap_batch),
+                    safe_mode=bool(safe_mode),
+                    force_refresh=False,
+                )
+                if bool(result.get("skipped", False)):
+                    st.error(_safe_str(result.get("reason", "本次未执行首轮建库推进。")))
+                    dns = result.get("dns", {}) if isinstance(result, dict) else {}
+                    fail_hosts = dns.get("fail_hosts", []) if isinstance(dns, dict) else []
+                    if fail_hosts:
+                        st.caption(f"DNS失败主机: {', '.join([_safe_str(x) for x in fail_hosts])}")
+                elif bool(result.get("fallback", False)):
+                    st.warning("本次推进发生回退，未完成有效深补。请先处理网络后重试。")
+                else:
+                    after = result.get("progress_after", {}) if isinstance(result, dict) else {}
+                    st.success(
+                        f"推进完成：新增深补 {int(result.get('added', 0) or 0)} 只，"
+                        f"累计 {int(after.get('enriched_done', 0) or 0)}/{int(after.get('eligible_total', 0) or 0)}"
+                    )
+                    if bool(result.get("completed", False)):
+                        st.success("首轮建库已完成。")
+                st.session_state["flt_result"] = None
+            except Exception as exc:
+                st.error(f"首轮建库推进失败: {exc}")
+
+    if u4.button("检测数据源DNS", use_container_width=True, key="flt_ops_dns_check"):
+        dns = filter_check_market_data_dns()
+        if bool(dns.get("ok")):
+            st.success(f"DNS可用：{', '.join([_safe_str(x) for x in dns.get('ok_hosts', [])])}")
+        else:
+            st.error("DNS不可用：当前无法连通东财行情主机。")
+            fail_hosts = dns.get("fail_hosts", []) if isinstance(dns, dict) else []
+            if fail_hosts:
+                st.caption(f"失败主机: {', '.join([_safe_str(x) for x in fail_hosts])}")
+
+    build_prog = filter_get_baseline_build_progress("AH")
+    st.caption(
+        f"A股首轮深补进度: {int(build_prog.get('enriched_done', 0) or 0)} / "
+        f"{int(build_prog.get('eligible_total', 0) or 0)} ｜ "
+        f"剩余 {int(build_prog.get('remaining', 0) or 0)}"
+    )
+    st.progress(float(build_prog.get("progress_ratio", 0.0) or 0.0), text=f"首轮建库进度 {float(build_prog.get('progress_pct', 0.0) or 0.0):.1f}%")
 
     report = filter_get_snapshot_health_report(days=7, top_n=20)
     qc = report.get("quality_counts", {})
@@ -2812,6 +3006,37 @@ def _render_paper_page():
         st.code(console_output, language="bash")
 
 
+def _load_portfolio_renderer():
+    app_path = CURRENT_DIR.parent / "portfolio" / "app.py"
+    if not app_path.exists():
+        raise FileNotFoundError(f"未找到仓位模块入口: {app_path}")
+    module_name = "_quant_portfolio_app"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, str(app_path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"无法加载仓位模块: {app_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    render_fn = getattr(module, "render_portfolio_page", None)
+    if not callable(render_fn):
+        raise RuntimeError("仓位模块缺少 render_portfolio_page()")
+    return render_fn
+
+
+def _render_portfolio_page():
+    try:
+        render_fn = _load_portfolio_renderer()
+    except Exception as exc:
+        st.error(f"仓位风控模块加载失败: {exc}")
+        return
+    try:
+        render_fn()
+    except Exception as exc:
+        st.error(f"仓位风控模块运行失败: {exc}")
+
+
 def _analysis_job_file(job_id: str) -> str:
     return os.path.join(ANALYSIS_JOB_DIR, f"{job_id}.json")
 
@@ -2832,7 +3057,7 @@ def _create_analysis_job(
         "created_at": datetime.now().strftime("%m-%d %H:%M:%S"),
         "stock_code": str(stock_code),
         "stock_name": str(stock_name),
-        "analysis_engine": "deep_only_v2",
+        "analysis_engine": "multi_agent_v1",
         "mode": str(mode),
         "status": "pending",
         "quick_json": quick_json,
@@ -2865,8 +3090,8 @@ def _upsert_live_analysis_job(
         current["quick_hash"] = quick_hash
         current["deep_hash"] = deep_hash
         current["updated_at"] = now_text
-        if str(current.get("analysis_engine", "")) != "deep_only_v2":
-            current["analysis_engine"] = "deep_only_v2"
+        if str(current.get("analysis_engine", "")) != "multi_agent_v1":
+            current["analysis_engine"] = "multi_agent_v1"
             current["mode"] = "idle"
             current["status"] = "pending"
             current.pop("final_text", None)
@@ -2887,7 +3112,7 @@ def _upsert_live_analysis_job(
         "updated_at": now_text,
         "stock_code": str(stock_code),
         "stock_name": str(stock_name),
-        "analysis_engine": "deep_only_v2",
+        "analysis_engine": "multi_agent_v1",
         "mode": "idle",
         "status": "pending",
         "quick_json": quick_json,
@@ -2931,6 +3156,26 @@ def _normalize_quick_result(quick_raw: str) -> dict:
     }
 
 
+def _render_multi_agent_meta(stats: dict) -> None:
+    meta = stats.get("multi_agent_meta", {}) if isinstance(stats, dict) else {}
+    if not isinstance(meta, dict) or not meta:
+        return
+    bull_prob = int(meta.get("bull_prob", 0) or 0)
+    bear_prob = int(meta.get("bear_prob", 0) or 0)
+    disagreement = float(meta.get("disagreement_score", 0.0) or 0.0) * 100
+    agreement = float(meta.get("agreement_score", 0.0) or 0.0) * 100
+    consensus = str(meta.get("consensus_side", "--"))
+    event_side = str(meta.get("event_side", "neutral"))
+    event_cn = {"bull": "偏多", "bear": "偏空", "neutral": "中性/不明"}.get(event_side, event_side)
+
+    c1, c2, c3, c4 = st.columns(4, gap="small")
+    c1.metric("做多胜率", f"{bull_prob}%")
+    c2.metric("做空胜率", f"{bear_prob}%")
+    c3.metric("专家分歧度", f"{disagreement:.1f}%")
+    c4.metric("一致性", f"{agreement:.1f}%")
+    st.caption(f"专家投票共识: {consensus} ｜ 事件面倾向: {event_cn}")
+
+
 def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, height: int = 560) -> None:
     final_text = str(job_obj.get("final_text", "") or "")
     done_mark = str(job_obj.get("done_at", "") or "")
@@ -2945,9 +3190,28 @@ def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, heig
         f"深析输入: {stats.get('deep_prompt_tokens', 0)} | 深析输出: {stats.get('deep_completion_tokens', 0)} | "
         f"预估总成本: {float(stats.get('total_cost', 0) or 0):.4f} 元"
     )
+    _render_multi_agent_meta(stats)
     report_text = _sanitize_deepseek_report(final_text)
     if report_text:
-        st.markdown(report_text)
+        def _chunk_gen(text: str, step: int = 80):
+            for i in range(0, len(text), max(20, int(step))):
+                yield text[i : i + max(20, int(step))]
+
+        should_stream = "_new_" in str(key_suffix) or str(key_suffix).startswith("new")
+        stream_once_key = f"_md_stream_done_{job_id}_{hashlib.md5((report_text + key_suffix).encode('utf-8')).hexdigest()[:10]}"
+        if should_stream and (not st.session_state.get(stream_once_key)):
+            md_stream = getattr(st, "markdown_stream", None)
+            if callable(md_stream):
+                md_stream(_chunk_gen(report_text))
+            else:
+                slot = st.empty()
+                acc = ""
+                for piece in _chunk_gen(report_text):
+                    acc += piece
+                    slot.markdown(acc)
+            st.session_state[stream_once_key] = True
+        else:
+            st.markdown(report_text)
     else:
         st.info("暂无分析文本。")
     st.text_area("分析文本（可复制）", value=report_text, height=min(height, 280), key=text_key)
@@ -3016,6 +3280,7 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
             deep_source = "手动刷新"
             cache_store[deep_hash] = {
                 "stage": "deep",
+                "analysis_engine": ANALYSIS_ENGINE_VERSION,
                 "result": deep_report,
                 "usage": deep_usage,
                 "saved_at": datetime.now().strftime("%m-%d %H:%M:%S"),
@@ -3032,7 +3297,7 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
         else:
             progress.progress(28, text=f"{ui_prefix}检查缓存...")
             d_cached = cache_store.get(deep_hash) if deep_hash else None
-            if d_cached and isinstance(d_cached, dict):
+            if d_cached and isinstance(d_cached, dict) and str(d_cached.get("analysis_engine", "")) == ANALYSIS_ENGINE_VERSION:
                 deep_report = str(d_cached.get("result", "") or "")
                 deep_usage = d_cached.get("usage", {}) or deep_usage
                 deep_source = "同快照复用"
@@ -3055,6 +3320,7 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
                     total_cost += float(d_cost or 0.0)
                     cache_store[deep_hash] = {
                         "stage": "deep",
+                        "analysis_engine": ANALYSIS_ENGINE_VERSION,
                         "result": deep_report,
                         "usage": deep_usage,
                         "saved_at": datetime.now().strftime("%m-%d %H:%M:%S"),
@@ -3079,6 +3345,7 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
             "deep_completion_tokens": int(deep_usage.get("completion_tokens", 0) or 0),
             "total_cost": float(total_cost),
             "deep_source": deep_source,
+            "multi_agent_meta": deep_usage.get("_multi_agent_meta", {}) if isinstance(deep_usage, dict) else {},
         }
 
         job["status"] = "done"
@@ -3200,6 +3467,9 @@ if st.session_state.get("active_page") == "backtest":
 if st.session_state.get("active_page") == "paper":
     _render_paper_page()
     st.stop()
+if st.session_state.get("active_page") == "portfolio":
+    _render_portfolio_page()
+    st.stop()
 
 
 if "fast_selected_code" not in st.session_state:
@@ -3305,6 +3575,431 @@ with group_cols[1]:
 with group_cols[2]:
     st.markdown('<div class="group-title">观察</div>', unsafe_allow_html=True)
     _render_stock_group(watch_rows, "watch")
+
+
+def _calc_display_change_pct(quote: dict) -> float:
+    current_price = quote.get("current_price")
+    prev_close = quote.get("prev_close")
+    api_change_pct = quote.get("change_pct")
+    if (
+        current_price is not None
+        and prev_close is not None
+        and prev_close > 0
+    ):
+        return float((current_price - prev_close) / prev_close * 100)
+    return float(api_change_pct or 0.0)
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _fetch_chart_ohlcv(symbol: str, count: int = 260) -> pd.DataFrame:
+    provider = _get_data_provider()
+    df = provider.get_kline(str(symbol), count=int(max(120, count)))
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+    data = df.copy()
+    if "date" not in data.columns:
+        if isinstance(data.index, pd.DatetimeIndex):
+            data = data.reset_index().rename(columns={"index": "date"})
+        else:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in data.columns:
+            data[col] = np.nan
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data = data.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").tail(count)
+    if data.empty:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    return data[["date", "open", "high", "low", "close", "volume"]].copy()
+
+
+def _calc_ai_support_resistance(kline_df: pd.DataFrame, panel: dict):
+    if kline_df.empty:
+        return None, None
+
+    df = kline_df.copy()
+    close = pd.to_numeric(df["close"], errors="coerce")
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    ma20 = close.rolling(20, min_periods=20).mean()
+    std20 = close.rolling(20, min_periods=20).std(ddof=0)
+    boll_upper = ma20 + 2.0 * std20
+    boll_lower = ma20 - 2.0 * std20
+
+    recent = df.tail(60).copy()
+    low_20 = pd.to_numeric(recent["low"], errors="coerce").tail(20).min()
+    high_20 = pd.to_numeric(recent["high"], errors="coerce").tail(20).max()
+    ma20_last = float(ma20.iloc[-1]) if len(ma20) and pd.notna(ma20.iloc[-1]) else None
+    bu_last = float(boll_upper.iloc[-1]) if len(boll_upper) and pd.notna(boll_upper.iloc[-1]) else None
+    bl_last = float(boll_lower.iloc[-1]) if len(boll_lower) and pd.notna(boll_lower.iloc[-1]) else None
+
+    tr = pd.concat([(high - low).abs(), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr14 = float(tr.rolling(14, min_periods=5).mean().iloc[-1]) if len(tr) else 0.0
+    if not np.isfinite(atr14):
+        atr14 = 0.0
+
+    indicators = panel.get("indicators", {}) if isinstance(panel, dict) else {}
+    ma5_now = indicators.get("ma5")
+    ma20_now = indicators.get("ma20")
+    macd_now = indicators.get("macd_hist")
+    trend_factor = 0.0
+    if ma5_now is not None and ma20_now is not None:
+        trend_factor += 0.6 if float(ma5_now) >= float(ma20_now) else -0.6
+    if macd_now is not None:
+        trend_factor += 0.4 if float(macd_now) >= 0 else -0.4
+
+    support_candidates = [x for x in (low_20, ma20_last, bl_last) if x is not None and np.isfinite(x)]
+    resistance_candidates = [x for x in (high_20, ma20_last, bu_last) if x is not None and np.isfinite(x)]
+    if not support_candidates or not resistance_candidates:
+        return None, None
+
+    support = float(np.average(support_candidates, weights=np.linspace(1.0, 1.4, len(support_candidates))))
+    resistance = float(np.average(resistance_candidates, weights=np.linspace(1.0, 1.4, len(resistance_candidates))))
+
+    # 简易 AI 风险调整：顺势上移支撑、逆势下移阻力（按 ATR 微调）
+    support += trend_factor * 0.12 * atr14
+    resistance += trend_factor * 0.08 * atr14
+    if support >= resistance:
+        mid = float((support + resistance) / 2.0)
+        support = mid - max(atr14 * 0.6, mid * 0.01)
+        resistance = mid + max(atr14 * 0.6, mid * 0.01)
+    return support, resistance
+
+
+def _build_lw_payload(kline_df: pd.DataFrame, panel: dict) -> dict:
+    if kline_df.empty:
+        return {}
+
+    df = kline_df.copy()
+    close = pd.to_numeric(df["close"], errors="coerce")
+    ma5 = close.rolling(5, min_periods=5).mean()
+    ma20 = close.rolling(20, min_periods=20).mean()
+    boll_mid = ma20
+    boll_std = close.rolling(20, min_periods=20).std(ddof=0)
+    boll_upper = boll_mid + 2.0 * boll_std
+    boll_lower = boll_mid - 2.0 * boll_std
+    support, resistance = _calc_ai_support_resistance(df, panel=panel)
+
+    def _time_str(ts) -> str:
+        return pd.to_datetime(ts).strftime("%Y-%m-%d")
+
+    candles = [
+        {
+            "time": _time_str(r.date),
+            "open": float(r.open),
+            "high": float(r.high),
+            "low": float(r.low),
+            "close": float(r.close),
+        }
+        for r in df.itertuples(index=False)
+    ]
+
+    volumes = []
+    for r in df.itertuples(index=False):
+        is_up = float(r.close) >= float(r.open)
+        volumes.append(
+            {
+                "time": _time_str(r.date),
+                "value": float(r.volume) if pd.notna(r.volume) else 0.0,
+                "color": "rgba(209,67,67,0.78)" if is_up else "rgba(31,171,99,0.78)",
+            }
+        )
+
+    def _line_series(series: pd.Series) -> list[dict]:
+        out: list[dict] = []
+        for t, v in zip(df["date"], series):
+            if pd.isna(v):
+                continue
+            out.append({"time": _time_str(t), "value": float(v)})
+        return out
+
+    overlays = {
+        "ma5": _line_series(ma5),
+        "ma20": _line_series(ma20),
+        "boll_mid": _line_series(boll_mid),
+        "boll_upper": _line_series(boll_upper),
+        "boll_lower": _line_series(boll_lower),
+    }
+    if support is not None and resistance is not None:
+        t0 = candles[0]["time"]
+        t1 = candles[-1]["time"]
+        overlays["ai_support"] = [{"time": t0, "value": float(support)}, {"time": t1, "value": float(support)}]
+        overlays["ai_resistance"] = [{"time": t0, "value": float(resistance)}, {"time": t1, "value": float(resistance)}]
+
+    return {"candles": candles, "volumes": volumes, "overlays": overlays}
+
+
+def _render_lightweight_kline_chart(selected_code: str, selected_name: str, panel: dict) -> None:
+    kline_df = _fetch_chart_ohlcv(selected_code, count=260)
+    if kline_df is None or kline_df.empty:
+        st.info("暂无可用日线K线数据，无法渲染交互K线。")
+        return
+
+    payload = _build_lw_payload(kline_df, panel=panel if isinstance(panel, dict) else {})
+    if not payload or not payload.get("candles"):
+        st.info("K线数据不足，暂不可渲染。")
+        return
+
+    render_section_intro(
+        "专业K线盯盘",
+        "主图为日线K线，叠加 MA5/MA20、布林带与 AI 支撑/阻力；下方同步成交量柱状图。",
+        kicker="Lightweight Charts",
+        pills=("Candles", "MA/BOLL Overlay", "AI 支撑阻力", "Volume Histogram"),
+    )
+
+    chart_payload = json.dumps(payload, ensure_ascii=False)
+    safe_id = re.sub(r"[^0-9A-Za-z_]", "_", str(selected_code))
+    html(
+        f"""
+        <div id="lw_wrap_{safe_id}" style="width:100%;min-height:740px;">
+          <div style="padding:8px 10px 4px 10px;color:#e8e3d2;font-weight:700;">
+            {selected_name} ({selected_code}) · 日线K线
+          </div>
+          <div id="lw_main_{safe_id}" style="width:100%;height:540px;"></div>
+          <div id="lw_vol_{safe_id}" style="width:100%;height:170px;margin-top:10px;"></div>
+        </div>
+        <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+        <script>
+        (function() {{
+          const payload = {chart_payload};
+          const mainEl = document.getElementById("lw_main_{safe_id}");
+          const volEl = document.getElementById("lw_vol_{safe_id}");
+          if (!mainEl || !volEl || !window.LightweightCharts) return;
+          mainEl.innerHTML = "";
+          volEl.innerHTML = "";
+          const width = Math.max(mainEl.clientWidth || 980, 680);
+
+          const commonLayout = {{
+            layout: {{
+              background: {{ color: '#0f1f34' }},
+              textColor: '#d9e2f0',
+            }},
+            grid: {{
+              vertLines: {{ color: 'rgba(255,255,255,0.06)' }},
+              horzLines: {{ color: 'rgba(255,255,255,0.06)' }},
+            }},
+            localization: {{
+              locale: 'zh-CN',
+            }},
+            rightPriceScale: {{
+              borderColor: 'rgba(255,255,255,0.15)',
+            }},
+            timeScale: {{
+              borderColor: 'rgba(255,255,255,0.15)',
+            }},
+            crosshair: {{
+              mode: 0
+            }},
+          }};
+
+          const mainChart = LightweightCharts.createChart(mainEl, {{
+            width,
+            height: 540,
+            ...commonLayout,
+          }});
+          const candle = mainChart.addCandlestickSeries({{
+            upColor: '#d14343',
+            downColor: '#1fab63',
+            borderVisible: false,
+            wickUpColor: '#d14343',
+            wickDownColor: '#1fab63',
+          }});
+          candle.setData(payload.candles || []);
+
+          const addLine = (data, color, width=1, style=0) => {{
+            if (!Array.isArray(data) || !data.length) return null;
+            const s = mainChart.addLineSeries({{
+              color,
+              lineWidth: width,
+              lineStyle: style,
+              priceLineVisible: false,
+              lastValueVisible: false,
+            }});
+            s.setData(data);
+            return s;
+          }};
+
+          addLine(payload.overlays?.ma5 || [], '#ffb454', 2, 0);
+          addLine(payload.overlays?.ma20 || [], '#58a6ff', 2, 0);
+          addLine(payload.overlays?.boll_mid || [], 'rgba(173,216,230,0.65)', 1, 1);
+          addLine(payload.overlays?.boll_upper || [], 'rgba(173,216,230,0.5)', 1, 2);
+          addLine(payload.overlays?.boll_lower || [], 'rgba(173,216,230,0.5)', 1, 2);
+          addLine(payload.overlays?.ai_support || [], 'rgba(80,200,120,0.95)', 2, 2);
+          addLine(payload.overlays?.ai_resistance || [], 'rgba(255,120,120,0.95)', 2, 2);
+
+          const volChart = LightweightCharts.createChart(volEl, {{
+            width,
+            height: 170,
+            ...commonLayout,
+            rightPriceScale: {{
+              scaleMargins: {{ top: 0.1, bottom: 0 }},
+              borderColor: 'rgba(255,255,255,0.15)',
+            }},
+          }});
+          const vol = volChart.addHistogramSeries({{
+            priceFormat: {{ type: 'volume' }},
+            priceScaleId: '',
+          }});
+          vol.priceScale().applyOptions({{ scaleMargins: {{ top: 0.15, bottom: 0 }} }});
+          vol.setData(payload.volumes || []);
+
+          const syncTimeRange = (source, target) => {{
+            source.timeScale().subscribeVisibleLogicalRangeChange((range) => {{
+              if (range) target.timeScale().setVisibleLogicalRange(range);
+            }});
+          }};
+          syncTimeRange(mainChart, volChart);
+          syncTimeRange(volChart, mainChart);
+
+          const fit = () => {{
+            mainChart.timeScale().fitContent();
+            volChart.timeScale().fitContent();
+          }};
+          fit();
+
+          const resize = () => {{
+            const w = Math.max(mainEl.clientWidth || 980, 680);
+            mainChart.applyOptions({{ width: w }});
+            volChart.applyOptions({{ width: w }});
+          }};
+          window.addEventListener('resize', resize, {{ passive: true }});
+        }})();
+        </script>
+        """,
+        height=760,
+        scrolling=False,
+    )
+
+
+def _render_intraday_orderbook_core(panel: dict, change_pct: float, orderbook_unit: str) -> None:
+    intraday_df = panel.get("intraday") if isinstance(panel, dict) else pd.DataFrame()
+    if intraday_df is None or not isinstance(intraday_df, pd.DataFrame):
+        intraday_df = pd.DataFrame(columns=["time", "price", "volume_lot", "amount"])
+    order_book_5 = panel.get("order_book_5", {"buy": [], "sell": []}) if isinstance(panel, dict) else {"buy": [], "sell": []}
+
+    st.markdown('<div class="subsection-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="fast-panels-gap"></div>', unsafe_allow_html=True)
+    render_section_intro(
+        "盘中结构",
+        "左侧保留分时强弱，右侧保留五档盘口，用双栏视角把成交节奏和挂单深度放在一起读。",
+        kicker="Intraday Structure",
+        pills=("资金分时", "五档盘口", "同屏观察"),
+    )
+    left, right = st.columns([2, 1], vertical_alignment="top")
+    with left:
+        st.markdown('<div class="panel-title">资金分时</div>', unsafe_allow_html=True)
+        if intraday_df.empty:
+            st.info("暂无分时资金数据")
+        else:
+            chart_df = intraday_df.set_index("time")
+            area_df = chart_df.reset_index()
+            area_color = "#ef4444" if (change_pct or 0) > 0 else ("#22c55e" if (change_pct or 0) < 0 else "#94a3b8")
+            chart = (
+                alt.Chart(area_df)
+                .mark_area(color=area_color, opacity=0.9)
+                .encode(
+                    x=alt.X("time:T", title="time"),
+                    y=alt.Y("volume_lot:Q", title="vol"),
+                )
+                .properties(height=330)
+                .configure_view(strokeOpacity=0)
+                .configure_axis(gridColor="#dbe4f0", labelColor="#4a5f7c", titleColor="#4a5f7c")
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    with right:
+        st.markdown(f'<div class="panel-title">实时盘口<span class="unit-sub">单位：{orderbook_unit}</span></div>', unsafe_allow_html=True)
+        sell_df = pd.DataFrame(order_book_5.get("sell", []))
+        buy_df = pd.DataFrame(order_book_5.get("buy", []))
+
+        if sell_df.empty or buy_df.empty:
+            st.info("暂无盘口数据")
+        else:
+            sell_df = sell_df.sort_values("level", ascending=False).copy()
+            buy_df = buy_df.sort_values("level", ascending=True).copy()
+            vol_max = max(
+                1.0,
+                max(pd.to_numeric(sell_df["volume_lot"], errors="coerce").fillna(0).max(), pd.to_numeric(buy_df["volume_lot"], errors="coerce").fillna(0).max()),
+            )
+
+            def _ob_rows(df: pd.DataFrame, side: str) -> str:
+                rows_html = ""
+                for _, r in df.iterrows():
+                    lvl = int(r.get("level", 0))
+                    price = r.get("price")
+                    vol = r.get("volume_lot")
+                    vol_num = float(vol) if vol is not None and pd.notna(vol) else 0.0
+                    width = int((vol_num / vol_max) * 100)
+                    width = max(width, 1 if vol_num > 0 else 0)
+                    lab_class = "ob-sell" if side == "sell" else "ob-buy"
+                    side_txt = "卖" if side == "sell" else "买"
+                    bar_class = "sell" if side == "sell" else "buy"
+                    p_txt = f"{float(price):.2f}" if price is not None and pd.notna(price) else "--"
+                    v_txt = f"{int(vol_num)}" if vol_num > 0 else "--"
+                    rows_html += (
+                        f'<div class="ob-row">'
+                        f'<div class="ob-lab {lab_class}">{side_txt}{lvl}</div>'
+                        f'<div class="ob-price {lab_class}">{p_txt}</div>'
+                        f'<div class="ob-bar-wrap"><div class="ob-bar {bar_class}" style="width:{width}%"></div></div>'
+                        f'<div class="ob-vol">{v_txt}</div>'
+                        f"</div>"
+                    )
+                return rows_html
+
+            html_text = (
+                '<div class="ob-block">'
+                + _ob_rows(sell_df, "sell")
+                + '<div class="ob-sep"></div>'
+                + _ob_rows(buy_df, "buy")
+                + "</div>"
+            )
+            st.markdown(html_text, unsafe_allow_html=True)
+
+    st.caption(panel.get("depth_note", ""))
+
+
+def _render_intraday_orderbook_fragment(
+    selected_code: str,
+    initial_panel: dict,
+    orderbook_unit: str,
+    auto_refresh: bool,
+    auto_refresh_seconds: int,
+) -> None:
+    cache_key = f"fast_panel_cache_{selected_code}"
+
+    def _load_live_panel() -> dict:
+        market_open = _is_market_open(selected_code)
+        if market_open:
+            panel_live = fetch_fast_panel(selected_code)
+            st.session_state[cache_key] = panel_live
+            return panel_live
+        cached = st.session_state.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        if isinstance(initial_panel, dict):
+            return initial_panel
+        panel_live = fetch_fast_panel(selected_code)
+        st.session_state[cache_key] = panel_live
+        return panel_live
+
+    if auto_refresh and _is_market_open(selected_code):
+        @st.fragment(run_every=f"{int(auto_refresh_seconds)}s")
+        def _live_intraday_fragment():
+            panel_live = _load_live_panel()
+            quote_live = panel_live.get("quote", {}) if isinstance(panel_live, dict) else {}
+            live_change_pct = _calc_display_change_pct(quote_live) if isinstance(quote_live, dict) else 0.0
+            _render_intraday_orderbook_core(panel_live, live_change_pct, orderbook_unit)
+
+        _live_intraday_fragment()
+    else:
+        panel_now = initial_panel if isinstance(initial_panel, dict) else _load_live_panel()
+        quote_now = panel_now.get("quote", {}) if isinstance(panel_now, dict) else {}
+        now_change_pct = _calc_display_change_pct(quote_now) if isinstance(quote_now, dict) else 0.0
+        _render_intraday_orderbook_core(panel_now, now_change_pct, orderbook_unit)
+
 
 def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     if panel is None:
@@ -3443,6 +4138,19 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     head_left, head_right = st.columns([3.2, 1], vertical_alignment="center")
     copy_slot = None
     q_time = _format_display_time(quote.get("quote_time"))
+    provider_used = str(quote.get("provider_used") or "").strip().lower()
+    qmt_enabled = bool(quote.get("qmt_enabled", False))
+    if provider_used == "primary":
+        provider_label = "QMT"
+    elif provider_used == "fallback":
+        provider_label = "免费接口(降级)"
+    elif provider_used == "error":
+        provider_label = "数据源异常"
+    else:
+        provider_label = "免费接口"
+    provider_hint = f"当前数据源: {provider_label}"
+    if not qmt_enabled:
+        provider_hint += " ｜ QMT开关: OFF"
     if price_now is not None:
         with head_left:
             st.markdown(
@@ -3456,6 +4164,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 unsafe_allow_html=True,
             )
             st.caption(f"更新时间: {q_time if q_time else 'N/A'}")
+            st.caption(provider_hint)
     with head_right:
         copy_slot = st.container()
 
@@ -3788,6 +4497,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         (
             ("当前周期", tf_caption),
             ("更新时间", q_time if q_time else "N/A"),
+            ("数据源", provider_label),
             ("盘口失衡", _fmt(ofi, 2)),
             ("估值口径", f"PB {_fmt(pb_val, 2)} / 股息 {_fmt_pct(dy_val, 2)}"),
         )
@@ -3819,7 +4529,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     analysis_json = json.dumps(analysis_payload, ensure_ascii=True, separators=(",", ":"))
     json_b64 = base64.b64encode(export_json.encode("utf-8")).decode("ascii")
     deep_json = analysis_json
-    deep_hash = hashlib.sha256(f"deep:{deep_json}".encode("utf-8")).hexdigest()
+    deep_hash = hashlib.sha256(f"{ANALYSIS_ENGINE_VERSION}:{deep_json}".encode("utf-8")).hexdigest()
     live_job_id = _upsert_live_analysis_job(
         stock_code=selected_code,
         stock_name=selected_name,
@@ -3873,86 +4583,19 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         for col, (title, kv_rows, desc) in zip(cols, cards[i : i + 4]):
             col.markdown(_card_html(title, kv_rows, desc), unsafe_allow_html=True)
 
-    st.markdown('<div class="subsection-divider"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="fast-panels-gap"></div>', unsafe_allow_html=True)
-    render_section_intro(
-        "盘中结构",
-        "左侧保留分时强弱，右侧保留五档盘口，用双栏视角把成交节奏和挂单深度放在一起读。",
-        kicker="Intraday Structure",
-        pills=("资金分时", "五档盘口", "同屏观察"),
+    _render_lightweight_kline_chart(
+        selected_code=selected_code,
+        selected_name=selected_name,
+        panel=panel if isinstance(panel, dict) else {},
     )
-    left, right = st.columns([2, 1], vertical_alignment="top")
-    with left:
-        st.markdown('<div class="panel-title">资金分时</div>', unsafe_allow_html=True)
-        if intraday_df.empty:
-            st.info("暂无分时资金数据")
-        else:
-            chart_df = intraday_df.set_index("time")
-            area_df = chart_df.reset_index()
-            # A股配色: 涨红跌绿, 平盘中性灰
-            area_color = "#ef4444" if (change_pct or 0) > 0 else ("#22c55e" if (change_pct or 0) < 0 else "#94a3b8")
-            chart = (
-                alt.Chart(area_df)
-                .mark_area(color=area_color, opacity=0.9)
-                .encode(
-                    x=alt.X("time:T", title="time"),
-                    y=alt.Y("volume_lot:Q", title="vol"),
-                )
-                .properties(height=330)
-                .configure_view(strokeOpacity=0)
-                .configure_axis(gridColor="#dbe4f0", labelColor="#4a5f7c", titleColor="#4a5f7c")
-            )
-            st.altair_chart(chart, use_container_width=True)
 
-    with right:
-        st.markdown(f'<div class="panel-title">实时盘口<span class="unit-sub">单位：{orderbook_unit}</span></div>', unsafe_allow_html=True)
-        sell_df = pd.DataFrame(order_book_5.get("sell", []))
-        buy_df = pd.DataFrame(order_book_5.get("buy", []))
-
-        if sell_df.empty or buy_df.empty:
-            st.info("暂无盘口数据")
-        else:
-            sell_df = sell_df.sort_values("level", ascending=False).copy()
-            buy_df = buy_df.sort_values("level", ascending=True).copy()
-            vol_max = max(
-                1.0,
-                max(pd.to_numeric(sell_df["volume_lot"], errors="coerce").fillna(0).max(), pd.to_numeric(buy_df["volume_lot"], errors="coerce").fillna(0).max()),
-            )
-
-            def _ob_rows(df: pd.DataFrame, side: str) -> str:
-                rows_html = ""
-                for _, r in df.iterrows():
-                    lvl = int(r.get("level", 0))
-                    price = r.get("price")
-                    vol = r.get("volume_lot")
-                    vol_num = float(vol) if vol is not None and pd.notna(vol) else 0.0
-                    width = int((vol_num / vol_max) * 100)
-                    width = max(width, 1 if vol_num > 0 else 0)
-                    lab_class = "ob-sell" if side == "sell" else "ob-buy"
-                    side_txt = "卖" if side == "sell" else "买"
-                    bar_class = "sell" if side == "sell" else "buy"
-                    p_txt = f"{float(price):.2f}" if price is not None and pd.notna(price) else "--"
-                    v_txt = f"{int(vol_num)}" if vol_num > 0 else "--"
-                    rows_html += (
-                        f'<div class="ob-row">'
-                        f'<div class="ob-lab {lab_class}">{side_txt}{lvl}</div>'
-                        f'<div class="ob-price {lab_class}">{p_txt}</div>'
-                        f'<div class="ob-bar-wrap"><div class="ob-bar {bar_class}" style="width:{width}%"></div></div>'
-                        f'<div class="ob-vol">{v_txt}</div>'
-                        f"</div>"
-                    )
-                return rows_html
-
-            html_text = (
-                '<div class="ob-block">'
-                + _ob_rows(sell_df, "sell")
-                + '<div class="ob-sep"></div>'
-                + _ob_rows(buy_df, "buy")
-                + "</div>"
-            )
-            st.markdown(html_text, unsafe_allow_html=True)
-
-    st.caption(panel.get("depth_note", ""))
+    _render_intraday_orderbook_fragment(
+        selected_code=selected_code,
+        initial_panel=panel if isinstance(panel, dict) else {},
+        orderbook_unit=orderbook_unit,
+        auto_refresh=bool(auto_refresh_on),
+        auto_refresh_seconds=int(auto_refresh_sec),
+    )
     st.markdown('<div class="subsection-divider"></div>', unsafe_allow_html=True)
     doc_cols = st.columns([5, 1], vertical_alignment="center")
     with doc_cols[0]:
@@ -3981,30 +4624,22 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         st.error(f"分析失败: {type(exc).__name__}: {exc}")
 
 
-def _render_fast_panel_fragment():
-    selected_code = st.session_state.get("fast_selected_code", rows[0]["code"])
-    selected_name = st.session_state.get("fast_selected_name", rows[0]["name"])
-    market_open = _is_market_open(selected_code)
+def _load_fast_panel_snapshot_once(selected_code: str) -> dict:
     cache_key = f"fast_panel_cache_{selected_code}"
-
-    panel = None
+    market_open = _is_market_open(selected_code)
     if market_open:
-        panel = fetch_fast_panel(selected_code)
-        st.session_state[cache_key] = panel
-    else:
-        panel = st.session_state.get(cache_key)
-        if panel is None:
-            # 闭市时允许抓取一次静态快照用于查看，但不进入自动刷新循环
-            panel = fetch_fast_panel(selected_code)
-            st.session_state[cache_key] = panel
+        panel_now = fetch_fast_panel(selected_code)
+        st.session_state[cache_key] = panel_now
+        return panel_now
+    cached = st.session_state.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+    panel_now = fetch_fast_panel(selected_code)
+    st.session_state[cache_key] = panel_now
+    return panel_now
 
-    _render_fast_panel(selected_code, selected_name, panel=panel)
 
-if auto_refresh_on and market_open_for_ctrl:
-    @st.fragment(run_every=f"{int(auto_refresh_sec)}s")
-    def _auto_fast_panel_fragment():
-        _render_fast_panel_fragment()
-
-    _auto_fast_panel_fragment()
-else:
-    _render_fast_panel_fragment()
+selected_code_for_panel = st.session_state.get("fast_selected_code", rows[0]["code"])
+selected_name_for_panel = st.session_state.get("fast_selected_name", rows[0]["name"])
+panel_snapshot = _load_fast_panel_snapshot_once(selected_code_for_panel)
+_render_fast_panel(selected_code_for_panel, selected_name_for_panel, panel=panel_snapshot)
