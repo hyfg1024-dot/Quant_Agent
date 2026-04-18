@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -80,6 +82,7 @@ class MarketSentimentSnapshot:
     max_board_3d: int
     updated_at: str
     fetch_error: str = ""
+    fetch_error_raw: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -100,6 +103,58 @@ class MarketSentimentEngine:
             ak = None
         self.ak = ak
 
+    @contextmanager
+    def _without_proxy_env(self):
+        """临时移除代理环境变量，避免国内行情源被本地代理/VPN干扰。"""
+        keys = [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ]
+        backup = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                os.environ.pop(k, None)
+            yield
+        finally:
+            for k, v in backup.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def _ak_call(self, fn_name: str, *args, **kwargs):
+        if self.ak is None or not hasattr(self.ak, fn_name):
+            raise AttributeError(f"akshare missing function: {fn_name}")
+        with self._without_proxy_env():
+            return getattr(self.ak, fn_name)(*args, **kwargs)
+
+    def _compact_error(self, text: str) -> str:
+        lower = str(text or "").lower()
+        tags: List[str] = []
+        if "proxyerror" in lower or "unable to connect to proxy" in lower:
+            tags.append("代理连接失败")
+        if "read timed out" in lower or "timeout" in lower:
+            tags.append("请求超时")
+        if "max retries exceeded" in lower:
+            tags.append("重试次数超限")
+        if "push2.eastmoney.com" in lower:
+            tags.append("东财接口不可达")
+        if "northbound" in lower:
+            tags.append("北向资金口径失败")
+        if "industry_flow" in lower:
+            tags.append("行业资金口径失败")
+        if "adv/dec" in lower:
+            tags.append("涨跌家数抓取失败")
+        if not tags:
+            tags.append("数据源异常，已降级")
+        return "；".join(dict.fromkeys(tags))
+
     def get_snapshot(self) -> MarketSentimentSnapshot:
         errors: List[str] = []
 
@@ -109,6 +164,9 @@ class MarketSentimentEngine:
         up_ratio = up_count / total
 
         flow_value_yi, flow_source = self._fetch_flow(errors)
+        # 保险兜底：若仍疑似以“元”入模（值过大），统一折算为“亿”
+        if abs(float(flow_value_yi)) > 50_000:
+            flow_value_yi = float(flow_value_yi) / 100_000_000.0
         limit_ups, board_heights = self._fetch_limitup_3d(errors)
 
         score = self._calc_score(
@@ -136,6 +194,7 @@ class MarketSentimentEngine:
             message = "市场情绪中性，建议以结构性机会为主。"
             warning_banner = ""
 
+        raw_error = "; ".join(errors[:3])
         return MarketSentimentSnapshot(
             score=round(float(score), 2),
             state=state,
@@ -152,7 +211,8 @@ class MarketSentimentEngine:
             limit_up_avg_3d=round(float(np.mean(limit_ups)) if limit_ups else 0.0, 2),
             max_board_3d=int(max(board_heights) if board_heights else 0),
             updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            fetch_error="; ".join(errors[:3]),
+            fetch_error=self._compact_error(raw_error),
+            fetch_error_raw=raw_error,
         )
 
     def _fetch_adv_dec(self, errors: List[str]) -> tuple[int, int]:
@@ -164,7 +224,7 @@ class MarketSentimentEngine:
             if not hasattr(self.ak, fn):
                 continue
             try:
-                df = getattr(self.ak, fn)()
+                df = self._ak_call(fn)
                 if df is None or df.empty:
                     continue
                 pct_col = None
@@ -198,7 +258,7 @@ class MarketSentimentEngine:
         # Priority 1: 北向资金净流入（亿）
         try:
             if hasattr(self.ak, "stock_hsgt_north_net_flow_in_em"):
-                df = self.ak.stock_hsgt_north_net_flow_in_em()
+                df = self._ak_call("stock_hsgt_north_net_flow_in_em")
                 val = self._extract_last_flow_value(df)
                 if val is not None:
                     return float(val), "northbound"
@@ -208,7 +268,7 @@ class MarketSentimentEngine:
         # Priority 2: 行业主力净流入（亿）作为替代
         try:
             if hasattr(self.ak, "stock_sector_fund_flow_rank"):
-                df = self.ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")
+                df = self._ak_call("stock_sector_fund_flow_rank", indicator="今日", sector_type="行业资金流")
                 if df is not None and (not df.empty):
                     col = next((c for c in df.columns if "主力净流入" in c), None)
                     if col:
@@ -238,7 +298,7 @@ class MarketSentimentEngine:
         if self.ak is not None:
             try:
                 if hasattr(self.ak, "tool_trade_date_hist_sina"):
-                    df = self.ak.tool_trade_date_hist_sina()
+                    df = self._ak_call("tool_trade_date_hist_sina")
                     if df is not None and (not df.empty):
                         col = "trade_date" if "trade_date" in df.columns else df.columns[0]
                         dates = pd.to_datetime(df[col], errors="coerce").dropna()
@@ -271,7 +331,7 @@ class MarketSentimentEngine:
                     limit_ups.append(0)
                     board_heights.append(0)
                     continue
-                df = self.ak.stock_zt_pool_em(date=day)
+                df = self._ak_call("stock_zt_pool_em", date=day)
                 if df is None or df.empty:
                     limit_ups.append(0)
                     board_heights.append(0)

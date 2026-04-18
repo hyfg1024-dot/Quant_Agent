@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
+import re
 from typing import Any, Dict, Sequence
 
 import streamlit as st
@@ -152,6 +153,7 @@ def _render_market_sentiment_bar() -> None:
     boards = snap.get("board_heights_3d", []) or [0, 0, 0]
     updated_at = str(snap.get("updated_at", "") or "")
     fetch_error = str(snap.get("fetch_error", "") or "")
+    fetch_error_raw = str(snap.get("fetch_error_raw", "") or fetch_error)
     has_breadth_data = (up_count + down_count) > 0
     flow_delta_map = {
         "northbound": "北向口径",
@@ -213,10 +215,35 @@ def _render_market_sentiment_bar() -> None:
         unsafe_allow_html=True,
     )
     if fetch_error:
-        short_err = fetch_error if len(fetch_error) <= 140 else f"{fetch_error[:140]}..."
+        short_err = _format_sentiment_error(fetch_error)
         st.caption(f"情绪数据回退说明: {short_err}")
         with st.expander("查看完整回退日志", expanded=False):
-            st.code(fetch_error)
+            st.code(fetch_error_raw)
+
+
+def _format_sentiment_error(error: str) -> str:
+    text = str(error or "").strip()
+    if not text:
+        return "数据源回退（未提供错误细节）"
+    lower = text.lower()
+    tags: list[str] = []
+    if "proxyerror" in lower or "unable to connect to proxy" in lower:
+        tags.append("代理连接失败")
+    if "read timed out" in lower or "timeout" in lower:
+        tags.append("请求超时")
+    if "max retries exceeded" in lower:
+        tags.append("重试次数超限")
+    if "push2.eastmoney.com" in lower:
+        tags.append("东财接口不可达")
+    if "northbound" in lower:
+        tags.append("北向资金口径失败")
+    if "industry_flow" in lower:
+        tags.append("行业资金口径失败")
+    if "adv/dec" in lower:
+        tags.append("涨跌家数抓取失败")
+    if not tags:
+        tags.append("数据源异常，已降级")
+    return "；".join(dict.fromkeys(tags))
 
 
 def _shell_style(meta: ShellMeta, active_page: str) -> str:

@@ -25,7 +25,7 @@ if str(FUNDAMENTAL_DIR) not in sys.path:
 
 from fundamental_engine import analyze_fundamental
 
-APP_VERSION = "FLT-20260327-02"
+APP_VERSION = "FLT-20260418-03"
 DATA_DIR = CURRENT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
 DB_PATH = DATA_DIR / "filter_market.db"
@@ -217,6 +217,152 @@ _PROXY_ENV_KEYS = (
     "NO_PROXY",
     "no_proxy",
 )
+_MARKET_NETWORK_MODE_CACHE: Dict[str, Any] = {"mode": "auto", "ts": 0.0}
+_DEFAULT_SURGE_PROXY = "http://127.0.0.1:6152"
+_LOCAL_PROXY_CANDIDATES = (
+    "http://127.0.0.1:6152",  # Surge 常见默认
+    "http://127.0.0.1:7890",  # Clash 常见默认
+    "http://127.0.0.1:9090",  # 其他代理常见端口
+)
+_LOCAL_PROXY_CACHE: Dict[str, Any] = {"url": _DEFAULT_SURGE_PROXY, "ok": False, "ts": 0.0}
+
+
+def _local_proxy_url() -> str:
+    """
+    代码层本机代理入口：
+    1) 优先读取 QUANT_LOCAL_HTTP_PROXY；
+    2) 否则自动探测常见本机端口。
+    """
+    env_url = _safe_str(os.getenv("QUANT_LOCAL_HTTP_PROXY", ""))
+    if env_url:
+        return env_url
+    now_ts = time.time()
+    if now_ts - float(_LOCAL_PROXY_CACHE.get("ts", 0.0) or 0.0) < 60:
+        return _safe_str(_LOCAL_PROXY_CACHE.get("url", _DEFAULT_SURGE_PROXY)) or _DEFAULT_SURGE_PROXY
+    env_candidates: List[str] = []
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        v = _safe_str(os.getenv(k, ""))
+        if v:
+            env_candidates.append(v)
+    candidates = tuple(dict.fromkeys([*env_candidates, *_LOCAL_PROXY_CANDIDATES]))
+    for u in candidates:
+        if _is_proxy_url_reachable(u):
+            _LOCAL_PROXY_CACHE["url"] = u
+            _LOCAL_PROXY_CACHE["ok"] = True
+            _LOCAL_PROXY_CACHE["ts"] = now_ts
+            return u
+    _LOCAL_PROXY_CACHE["url"] = _DEFAULT_SURGE_PROXY
+    _LOCAL_PROXY_CACHE["ok"] = False
+    _LOCAL_PROXY_CACHE["ts"] = now_ts
+    return _DEFAULT_SURGE_PROXY
+
+
+def _force_surge_local_proxy() -> bool:
+    return _safe_str(os.getenv("QUANT_FORCE_SURGE_PROXY", "0")).lower() in {"1", "true", "yes", "on"}
+
+
+def _is_proxy_url_reachable(proxy_url: str, timeout: float = 0.6) -> bool:
+    """
+    探测本机代理端口是否可用；用于在 Surge 增强模式下自动切换到本地代理通道。
+    """
+    url = _safe_str(proxy_url)
+    m = re.match(r"^https?://([^:/]+):(\d+)", url)
+    if not m:
+        return False
+    host = _safe_str(m.group(1)) or "127.0.0.1"
+    try:
+        port = int(m.group(2))
+    except Exception:
+        return False
+
+
+def _is_local_proxy_reachable(proxy_url: Optional[str] = None, timeout: float = 0.6) -> bool:
+    url = _safe_str(proxy_url or _local_proxy_url())
+    return _is_proxy_url_reachable(url, timeout=timeout)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _market_probe_request(mode: str = "direct") -> bool:
+    """
+    轻量探测东财接口可达性。
+    mode:
+      - direct: 不读取系统代理
+      - proxy: 读取系统代理（Surge 场景）
+    """
+    hosts = [
+        "https://82.push2.eastmoney.com/api/qt/clist/get",
+        "https://push2.eastmoney.com/api/qt/clist/get",
+        "http://82.push2.eastmoney.com/api/qt/clist/get",
+        "http://push2.eastmoney.com/api/qt/clist/get",
+    ]
+    params = {
+        "pn": "1",
+        "pz": "1",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f12",
+        "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+        "fields": "f12,f14",
+    }
+    proxy_url = _local_proxy_url()
+    for url in hosts:
+        try:
+            ses = requests.Session()
+            if mode == "surge_local":
+                ses.trust_env = False
+                ses.proxies.update({"http": proxy_url, "https": proxy_url})
+            else:
+                ses.trust_env = bool(mode == "proxy")
+            resp = ses.get(
+                url,
+                params=params,
+                timeout=6,
+                headers={"User-Agent": "Mozilla/5.0", "Connection": "close", "Accept": "application/json,text/plain,*/*"},
+            )
+            resp.raise_for_status()
+            obj = resp.json() or {}
+            diff = ((obj.get("data") or {}).get("diff") or [])
+            if isinstance(diff, list):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _resolve_market_network_mode(force: bool = False) -> str:
+    """
+    自动判定更新通道：
+      - direct: 本机直连可用
+      - proxy: 需经系统代理（Surge）可用
+      - none: 两者都不可用
+    """
+    now_ts = time.time()
+    if (not force) and (now_ts - float(_MARKET_NETWORK_MODE_CACHE.get("ts", 0.0) or 0.0) < 120):
+        return _safe_str(_MARKET_NETWORK_MODE_CACHE.get("mode", "auto")) or "auto"
+
+    force_surge = _force_surge_local_proxy()
+    local_proxy_ok = _is_local_proxy_reachable()
+
+    mode = "none"
+    if force_surge and local_proxy_ok:
+        mode = "surge_local"
+    elif local_proxy_ok:
+        mode = "surge_local"
+    elif _market_probe_request("direct"):
+        mode = "direct"
+    elif _market_probe_request("proxy"):
+        mode = "proxy"
+
+    _MARKET_NETWORK_MODE_CACHE["mode"] = mode
+    _MARKET_NETWORK_MODE_CACHE["ts"] = now_ts
+    return mode
 
 
 def _ak_call_with_proxy_fallback(func, *args, **kwargs):
@@ -250,6 +396,30 @@ def _ak_call_with_proxy_fallback(func, *args, **kwargs):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = str(v)
+
+    # 第三轮：强制注入本机代理（Surge 增强模式场景）
+    if _force_surge_local_proxy():
+        proxy_url = _local_proxy_url()
+        backup2 = {k: os.environ.get(k, _ENV_MISSING) for k in _PROXY_ENV_KEYS}
+        try:
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            os.environ["http_proxy"] = proxy_url
+            os.environ["https_proxy"] = proxy_url
+            os.environ.pop("NO_PROXY", None)
+            os.environ.pop("no_proxy", None)
+            for _ in range(2):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(0.8)
+        finally:
+            for k, v in backup2.items():
+                if v is _ENV_MISSING:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = str(v)
 
     if last_exc is not None:
         raise last_exc
@@ -626,12 +796,12 @@ def _build_universe_from_spot(spot_df: pd.DataFrame, market: str) -> pd.DataFram
     return df
 
 
-def _fetch_hk_spot_ak() -> pd.DataFrame:
+def _fetch_hk_spot_ak(network_mode: str = "auto") -> pd.DataFrame:
     # 港股口径固定为“主板+GEM公司”，直连失败时由上层走快照回退，不降级为全证券口径。
-    return _fetch_hk_spot_em_direct()
+    return _fetch_hk_spot_em_direct(network_mode=network_mode)
 
 
-def _fetch_hk_spot_em_direct() -> pd.DataFrame:
+def _fetch_hk_spot_em_direct(network_mode: str = "auto") -> pd.DataFrame:
     """
     港股东方财富直连（禁用系统代理），优先获取市值等字段，避免 AKShare 精简字段导致大量空值。
     """
@@ -639,6 +809,9 @@ def _fetch_hk_spot_em_direct() -> pd.DataFrame:
         "https://72.push2.eastmoney.com/api/qt/clist/get",
         "https://81.push2.eastmoney.com/api/qt/clist/get",
         "https://push2.eastmoney.com/api/qt/clist/get",
+        "http://72.push2.eastmoney.com/api/qt/clist/get",
+        "http://81.push2.eastmoney.com/api/qt/clist/get",
+        "http://push2.eastmoney.com/api/qt/clist/get",
     ]
     base_params = {
         "pn": "1",
@@ -670,77 +843,111 @@ def _fetch_hk_spot_em_direct() -> pd.DataFrame:
         ),
     }
 
+    mode = _safe_str(network_mode).lower() or "auto"
+    if mode == "auto":
+        mode = _resolve_market_network_mode(force=False)
+    if mode in {"direct", "proxy", "surge_local"}:
+        mode_order = [mode]
+    else:
+        mode_order = (
+            ["surge_local", "proxy", "direct"]
+            if (_force_surge_local_proxy() or _is_local_proxy_reachable())
+            else ["direct", "proxy"]
+        )
+    proxy_url = _local_proxy_url()
+
     last_exc: Optional[Exception] = None
-    for url in hosts:
-        for _ in range(2):
-            try:
-                rows: List[Dict[str, Any]] = []
-                seen_codes: set[str] = set()
-                total_hint: Optional[int] = None
-                ses = requests.Session()
-                ses.trust_env = False
-
-                for page in range(1, 120):
-                    params = dict(base_params)
-                    params["pn"] = str(page)
-                    resp = ses.get(url, params=params, timeout=18, headers={"User-Agent": "Mozilla/5.0"})
-                    resp.raise_for_status()
-                    obj = resp.json()
-                    data_obj = (obj or {}).get("data") or {}
-                    if total_hint is None:
+    for req_mode in mode_order:
+        for url in hosts:
+            for _ in range(2):
+                try:
+                    rows: List[Dict[str, Any]] = []
+                    seen_codes: set[str] = set()
+                    total_hint: Optional[int] = None
+                    ses = requests.Session()
+                    if req_mode == "surge_local":
+                        ses.trust_env = False
+                        ses.proxies.update({"http": proxy_url, "https": proxy_url})
+                    else:
+                        ses.trust_env = bool(req_mode == "proxy")
+                    for page in range(1, 120):
+                        params = dict(base_params)
+                        params["pn"] = str(page)
                         try:
-                            total_hint = int(_to_float(data_obj.get("total")) or 0)
-                        except Exception:
-                            total_hint = None
-                    diff = data_obj.get("diff") or []
-                    if not diff:
-                        break
+                            resp = ses.get(
+                                url,
+                                params=params,
+                                timeout=18,
+                                headers={
+                                    "User-Agent": "Mozilla/5.0",
+                                    "Connection": "close",
+                                    "Accept": "application/json,text/plain,*/*",
+                                },
+                            )
+                            resp.raise_for_status()
+                            obj = resp.json()
+                            data_obj = (obj or {}).get("data") or {}
+                            if total_hint is None:
+                                try:
+                                    total_hint = int(_to_float(data_obj.get("total")) or 0)
+                                except Exception:
+                                    total_hint = None
+                            diff = data_obj.get("diff") or []
+                        except Exception as page_exc:
+                            last_exc = page_exc
+                            # 分页中断时保留已抓到的数据，避免整批回退
+                            break
 
-                    page_new = 0
-                    for it in diff:
-                        raw = it or {}
-                        code = str(raw.get("f12", "")).strip()
-                        if (not code) or (code in seen_codes):
-                            continue
-                        seen_codes.add(code)
-                        page_new += 1
-                        industry = _safe_str(raw.get("f100")) or _safe_str(raw.get("f127"))
-                        rows.append(
-                            {
-                                "代码": code,
-                                "名称": str(raw.get("f14", "")).strip(),
-                                "所处行业": industry,
-                                "最新价": _to_float(raw.get("f2")),
-                                "涨跌幅": _to_float(raw.get("f3")),
-                                "成交额": _to_float(raw.get("f6")),
-                                "市盈率-动态": _to_float(raw.get("f9")),
-                                "市净率": _to_float(raw.get("f23")),
-                                "股息率": None,
-                                "总市值": _to_float(raw.get("f20")),
-                                "流通市值": _to_float(raw.get("f21")),
-                                "换手率": _to_float(raw.get("f8")),
-                                "量比": _to_float(raw.get("f10")),
-                            }
-                        )
-                    if page_new == 0:
-                        break
-                    if total_hint and len(rows) >= total_hint:
-                        break
+                        if not diff:
+                            break
 
-                out = pd.DataFrame(rows)
-                if out.empty:
-                    raise RuntimeError("港股直连结果为空")
-                return out
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(0.8)
+                        page_new = 0
+                        for it in diff:
+                            raw = it or {}
+                            code = str(raw.get("f12", "")).strip()
+                            if (not code) or (code in seen_codes):
+                                continue
+                            seen_codes.add(code)
+                            page_new += 1
+                            industry = _safe_str(raw.get("f100")) or _safe_str(raw.get("f127"))
+                            rows.append(
+                                {
+                                    "代码": code,
+                                    "名称": str(raw.get("f14", "")).strip(),
+                                    "所处行业": industry,
+                                    "最新价": _to_float(raw.get("f2")),
+                                    "涨跌幅": _to_float(raw.get("f3")),
+                                    "成交额": _to_float(raw.get("f6")),
+                                    "市盈率-动态": _to_float(raw.get("f9")),
+                                    "市净率": _to_float(raw.get("f23")),
+                                    "股息率": None,
+                                    "总市值": _to_float(raw.get("f20")),
+                                    "流通市值": _to_float(raw.get("f21")),
+                                    "换手率": _to_float(raw.get("f8")),
+                                    "量比": _to_float(raw.get("f10")),
+                                }
+                            )
+                        if page_new == 0:
+                            break
+                        if total_hint and len(rows) >= total_hint:
+                            break
+
+                    out = pd.DataFrame(rows)
+                    if out.empty:
+                        raise RuntimeError("港股直连结果为空")
+                    _MARKET_NETWORK_MODE_CACHE["mode"] = req_mode
+                    _MARKET_NETWORK_MODE_CACHE["ts"] = time.time()
+                    return out
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(0.8)
 
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("港股直连失败")
 
 
-def _build_base_universe(market_scope: str = "A") -> pd.DataFrame:
+def _build_base_universe(market_scope: str = "A", network_mode: str = "auto") -> pd.DataFrame:
     scope = _safe_str(market_scope).upper() or "A"
     use_a = scope in {"A", "AH", "ALL"}
     use_hk = scope in {"HK", "AH", "ALL"}
@@ -750,17 +957,17 @@ def _build_base_universe(market_scope: str = "A") -> pd.DataFrame:
     if use_a:
         try:
             # 优先走直连端点，速度更稳定，也避免 AKShare 分页进度阻塞。
-            spot_a = _fetch_a_spot_em_direct()
-        except Exception:
-            spot_a = _ak_call_with_proxy_fallback(ak.stock_zh_a_spot_em)
-        if spot_a is None or spot_a.empty:
-            errors.append("A股快照为空")
-        else:
-            frames.append(_build_universe_from_spot(spot_a, market="A"))
+            spot_a = _fetch_a_spot_em_direct(network_mode=network_mode)
+            if spot_a is None or spot_a.empty:
+                errors.append("A股快照为空")
+            else:
+                frames.append(_build_universe_from_spot(spot_a, market="A"))
+        except Exception as exc:
+            errors.append(f"A股拉取失败: {exc}")
 
     if use_hk:
         try:
-            spot_hk = _fetch_hk_spot_ak()
+            spot_hk = _fetch_hk_spot_ak(network_mode=network_mode)
             if spot_hk is None or spot_hk.empty:
                 errors.append("港股快照为空")
             else:
@@ -847,7 +1054,7 @@ def _build_base_universe_legacy() -> pd.DataFrame:
     return df
 
 
-def _fetch_a_spot_em_direct() -> pd.DataFrame:
+def _fetch_a_spot_em_direct(network_mode: str = "auto") -> pd.DataFrame:
     """
     东方财富直连兜底（禁用系统代理），避免 ProxyError 导致整次更新失败。
     仅提供筛选所需核心字段。
@@ -856,6 +1063,9 @@ def _fetch_a_spot_em_direct() -> pd.DataFrame:
         "https://82.push2.eastmoney.com/api/qt/clist/get",
         "https://push2.eastmoney.com/api/qt/clist/get",
         "https://71.push2.eastmoney.com/api/qt/clist/get",
+        "http://82.push2.eastmoney.com/api/qt/clist/get",
+        "http://push2.eastmoney.com/api/qt/clist/get",
+        "http://71.push2.eastmoney.com/api/qt/clist/get",
     ]
     base_params = {
         "pn": "1",
@@ -886,67 +1096,102 @@ def _fetch_a_spot_em_direct() -> pd.DataFrame:
         ),
     }
 
+    mode = _safe_str(network_mode).lower() or "auto"
+    if mode == "auto":
+        mode = _resolve_market_network_mode(force=False)
+    if mode in {"direct", "proxy", "surge_local"}:
+        mode_order = [mode]
+    else:
+        mode_order = (
+            ["surge_local", "proxy", "direct"]
+            if (_force_surge_local_proxy() or _is_local_proxy_reachable())
+            else ["direct", "proxy"]
+        )
+    proxy_url = _local_proxy_url()
+
     last_exc: Optional[Exception] = None
-    for url in hosts:
-        for _ in range(2):
-            try:
-                rows: List[Dict[str, Any]] = []
-                seen_codes: set[str] = set()
-                total_hint: Optional[int] = None
-                ses = requests.Session()
-                ses.trust_env = False
+    for req_mode in mode_order:
+        for url in hosts:
+            for _ in range(2):
+                try:
+                    rows: List[Dict[str, Any]] = []
+                    seen_codes: set[str] = set()
+                    total_hint: Optional[int] = None
+                    ses = requests.Session()
+                    if req_mode == "surge_local":
+                        ses.trust_env = False
+                        ses.proxies.update({"http": proxy_url, "https": proxy_url})
+                    else:
+                        ses.trust_env = bool(req_mode == "proxy")
 
-                for page in range(1, 120):
-                    params = dict(base_params)
-                    params["pn"] = str(page)
-                    resp = ses.get(url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-                    resp.raise_for_status()
-                    obj = resp.json()
-                    data_obj = (obj or {}).get("data") or {}
-                    if total_hint is None:
+                    for page in range(1, 120):
+                        params = dict(base_params)
+                        params["pn"] = str(page)
                         try:
-                            total_hint = int(_to_float(data_obj.get("total")) or 0)
-                        except Exception:
-                            total_hint = None
-                    diff = data_obj.get("diff") or []
-                    if not diff:
-                        break
+                            resp = ses.get(
+                                url,
+                                params=params,
+                                timeout=15,
+                                headers={
+                                    "User-Agent": "Mozilla/5.0",
+                                    "Connection": "close",
+                                    "Accept": "application/json,text/plain,*/*",
+                                },
+                            )
+                            resp.raise_for_status()
+                            obj = resp.json()
+                            data_obj = (obj or {}).get("data") or {}
+                            if total_hint is None:
+                                try:
+                                    total_hint = int(_to_float(data_obj.get("total")) or 0)
+                                except Exception:
+                                    total_hint = None
+                            diff = data_obj.get("diff") or []
+                        except Exception as page_exc:
+                            last_exc = page_exc
+                            # 分页中断时保留已抓到的数据，避免整次更新回退
+                            break
 
-                    page_new = 0
-                    for it in diff:
-                        raw = it or {}
-                        code = str(raw.get("f12", "")).strip()
-                        if (not code) or (code in seen_codes):
-                            continue
-                        seen_codes.add(code)
-                        page_new += 1
-                        rows.append(
-                            {
-                                "代码": code,
-                                "名称": str(raw.get("f14", "")).strip(),
-                                "所处行业": str(raw.get("f100", "")).strip(),
-                                "最新价": _to_float(raw.get("f2")),
-                                "涨跌幅": _to_float(raw.get("f3")),
-                                "成交额": _to_float(raw.get("f6")),
-                                "市盈率-动态": _to_float(raw.get("f9")),
-                                "市净率": _to_float(raw.get("f23")),
-                                "股息率": None,
-                                "总市值": _to_float(raw.get("f20")),
-                                "流通市值": _to_float(raw.get("f21")),
-                                "换手率": _to_float(raw.get("f8")),
-                                "量比": _to_float(raw.get("f10")),
-                            }
-                        )
-                    if page_new == 0:
-                        break
-                    if total_hint and len(rows) >= total_hint:
-                        break
-                if not rows:
-                    raise RuntimeError("东方财富直连返回空数据")
-                return pd.DataFrame(rows)
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(0.8)
+                        if not diff:
+                            break
+
+                        page_new = 0
+                        for it in diff:
+                            raw = it or {}
+                            code = str(raw.get("f12", "")).strip()
+                            if (not code) or (code in seen_codes):
+                                continue
+                            seen_codes.add(code)
+                            page_new += 1
+                            rows.append(
+                                {
+                                    "代码": code,
+                                    "名称": str(raw.get("f14", "")).strip(),
+                                    "所处行业": str(raw.get("f100", "")).strip(),
+                                    "最新价": _to_float(raw.get("f2")),
+                                    "涨跌幅": _to_float(raw.get("f3")),
+                                    "成交额": _to_float(raw.get("f6")),
+                                    "市盈率-动态": _to_float(raw.get("f9")),
+                                    "市净率": _to_float(raw.get("f23")),
+                                    "股息率": None,
+                                    "总市值": _to_float(raw.get("f20")),
+                                    "流通市值": _to_float(raw.get("f21")),
+                                    "换手率": _to_float(raw.get("f8")),
+                                    "量比": _to_float(raw.get("f10")),
+                                }
+                            )
+                        if page_new == 0:
+                            break
+                        if total_hint and len(rows) >= total_hint:
+                            break
+                    if not rows:
+                        raise RuntimeError("东方财富直连返回空数据")
+                    _MARKET_NETWORK_MODE_CACHE["mode"] = req_mode
+                    _MARKET_NETWORK_MODE_CACHE["ts"] = time.time()
+                    return pd.DataFrame(rows)
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(0.8)
 
     if last_exc is not None:
         raise last_exc
@@ -1003,7 +1248,12 @@ def _classify_error_type(text: Any) -> str:
     t = _safe_str(text).lower()
     if not t:
         return "none"
-    if "name resolution" in t or "failed to resolve" in t or "nodename nor servname" in t:
+    if (
+        "name resolution" in t
+        or "failed to resolve" in t
+        or "nodename nor servname" in t
+        or "not known" in t
+    ):
         return "dns"
     if "proxy" in t:
         return "proxy"
@@ -1046,11 +1296,15 @@ def check_market_data_dns(hosts: Optional[List[str]] = None) -> Dict[str, Any]:
             detail[h] = {"ok": False, "error": _safe_str(exc)}
             fail_hosts.append(h)
 
+    network_mode = _resolve_market_network_mode(force=False)
+    transport_ok = network_mode in {"direct", "proxy", "surge_local"}
     return {
         "ok": len(ok_hosts) > 0,
         "ok_hosts": ok_hosts,
         "fail_hosts": fail_hosts,
         "detail": detail,
+        "network_mode": network_mode,
+        "transport_ok": transport_ok,
     }
 
 
@@ -1123,17 +1377,6 @@ def run_baseline_build_once(
     dns = check_market_data_dns()
     before = get_baseline_build_progress(scope)
 
-    if not bool(dns.get("ok")):
-        return {
-            "skipped": True,
-            "reason": "数据源 DNS 不可达，已跳过本次首轮建库推进。",
-            "dns": dns,
-            "progress_before": before,
-            "progress_after": before,
-            "added": 0,
-            "completed": bool(before.get("remaining", 0) == 0 and before.get("eligible_total", 0) > 0),
-        }
-
     stats = refresh_market_snapshot(
         max_stocks=0,
         enrich_top_n=max(0, int(enrich_batch)),
@@ -1156,6 +1399,7 @@ def run_baseline_build_once(
     out.update(
         {
             "dns": dns,
+            "network_mode": _safe_str(out.get("network_mode")) or _safe_str(_MARKET_NETWORK_MODE_CACHE.get("mode")) or "auto",
             "progress_before": before,
             "progress_after": after,
             "added": added,
@@ -1176,6 +1420,9 @@ def refresh_market_snapshot(
 ) -> Dict[str, Any]:
     init_db()
     scope = _safe_str(market_scope).upper() or "A"
+    dns = check_market_data_dns()
+    network_mode = _resolve_market_network_mode(force=True)
+    attempt_mode = network_mode if network_mode in {"direct", "proxy", "surge_local"} else "auto"
     meta0 = get_snapshot_meta()
     if weekly_mode:
         last_weekly = _safe_str(meta0.get(f"last_weekly_update_{scope}", ""))
@@ -1198,40 +1445,22 @@ def refresh_market_snapshot(
                         "market_scope": scope,
                     }
     enrich_mode = "rotate" if rotate_enrich else "top"
+    base_fallback = False
+    base_error = ""
     try:
-        df = _build_base_universe(market_scope=scope).copy()
+        df = _build_base_universe(market_scope=scope, network_mode=attempt_mode).copy()
     except Exception as exc:
-        # 网络/代理异常时兜底：如果本地已有快照，不让更新动作直接失败
+        # 网络/代理异常时兜底：优先复用本地快照继续深补推进
         existed = load_snapshot()
+        network_mode_used = _safe_str(_MARKET_NETWORK_MODE_CACHE.get("mode")) or attempt_mode
         if existed is not None and not existed.empty:
-            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _snapshot_meta_set("last_refresh_error", str(exc))
-            _snapshot_meta_set("last_refresh_error_at", now_text)
-            _snapshot_meta_set("last_refresh_fallback", "1")
-            _log_snapshot_run(
-                row_count=int(len(existed)),
-                enriched_count=0,
-                enrich_start=0,
-                enrich_end=0,
-                fallback=True,
-                error_brief=str(exc),
-                cache_hit=0,
-                cache_miss=0,
-                enrich_mode=enrich_mode,
-            )
-            return {
-                "row_count": int(len(existed)),
-                "enriched_count": 0,
-                "updated_at": now_text,
-                "fallback": True,
-                "error": str(exc),
-                "enrich_mode": enrich_mode,
-                "enrich_start": 0,
-                "enrich_end": 0,
-            }
-        raise RuntimeError(
-            f"未能拉取市场快照（可能是代理/VPN导致连接被拒绝）：{exc}"
-        ) from exc
+            df = existed.copy()
+            base_fallback = True
+            base_error = str(exc)
+        else:
+            raise RuntimeError(
+                f"未能拉取市场快照（可能是代理/VPN导致连接被拒绝）：{exc}"
+            ) from exc
     if "market" not in df.columns:
         df["market"] = "A"
     df["market"] = df["market"].astype(str).str.upper()
@@ -1239,7 +1468,12 @@ def refresh_market_snapshot(
         ((df["market"] == "A") & df["code"].astype(str).str.fullmatch(r"\d{6}", na=False))
         | ((df["market"] == "HK") & df["code"].astype(str).str.fullmatch(r"\d{5}", na=False))
     ].copy()
-    df = df.sort_values(by=["total_mv", "code"], ascending=[False, True], na_position="last").reset_index(drop=True)
+    # 强制去重，避免同一代码在回退快照路径被重复累积
+    df = (
+        df.drop_duplicates(subset=["market", "code"], keep="first")
+        .sort_values(by=["total_mv", "code"], ascending=[False, True], na_position="last")
+        .reset_index(drop=True)
+    )
 
     if max_stocks and max_stocks > 0:
         df = df.head(int(max_stocks)).copy()
@@ -1399,13 +1633,14 @@ def refresh_market_snapshot(
         save_df.to_sql("market_snapshot", conn, if_exists="replace", index=False)
         conn.commit()
 
-    _snapshot_meta_set("last_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _snapshot_meta_set("last_update", now_text)
     _snapshot_meta_set("row_count", str(len(save_df)))
     _snapshot_meta_set("enriched_count", str(enrich_n))
     _snapshot_meta_set("app_version", APP_VERSION)
-    _snapshot_meta_set("last_refresh_fallback", "0")
-    _snapshot_meta_set("last_refresh_error", "")
-    _snapshot_meta_set("last_refresh_error_at", "")
+    _snapshot_meta_set("last_refresh_fallback", "1" if base_fallback else "0")
+    _snapshot_meta_set("last_refresh_error", base_error if base_fallback else "")
+    _snapshot_meta_set("last_refresh_error_at", now_text if base_fallback else "")
     _snapshot_meta_set("last_scope", scope)
     if rotate_enrich and enrich_n > 0 and eligible_total > 0:
         _snapshot_meta_set(cursor_key, str((start_idx + enrich_n) % eligible_total))
@@ -1420,17 +1655,18 @@ def refresh_market_snapshot(
         enriched_count=enrich_n,
         enrich_start=enrich_start,
         enrich_end=enrich_end,
-        fallback=False,
-        error_brief="",
+        fallback=bool(base_fallback),
+        error_brief=base_error if base_fallback else "",
         cache_hit=cache_hit,
         cache_miss=cache_miss,
         enrich_mode=enrich_mode,
     )
+    network_mode_used = _safe_str(_MARKET_NETWORK_MODE_CACHE.get("mode")) or attempt_mode
 
     return {
         "row_count": len(save_df),
         "enriched_count": enrich_n,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": now_text,
         "enrich_mode": enrich_mode,
         "enrich_start": enrich_start,
         "enrich_end": enrich_end,
@@ -1438,6 +1674,9 @@ def refresh_market_snapshot(
         "cache_miss": cache_miss,
         "market_scope": scope,
         "weekly_mode": bool(weekly_mode),
+        "network_mode": network_mode_used,
+        "base_fallback": bool(base_fallback),
+        "base_error": base_error if base_fallback else "",
     }
 
 

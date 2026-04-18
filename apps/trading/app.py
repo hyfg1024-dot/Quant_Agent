@@ -1708,11 +1708,28 @@ def _render_filter_ops_panel() -> None:
                     safe_mode=bool(safe_mode),
                 )
                 if bool(stats.get("fallback", False)):
-                    st.warning("本次未连通接口，已回退本地快照。")
+                    err_type = _safe_str(stats.get("error_type", ""))
+                    network_mode = _safe_str(stats.get("network_mode", ""))
+                    if err_type == "dns":
+                        st.warning("本次未连通接口（DNS不可达），已回退本地快照。")
+                    elif err_type == "proxy":
+                        st.warning("本次接口受代理影响，已回退本地快照。")
+                    elif err_type == "timeout":
+                        st.warning("本次接口请求超时，已回退本地快照。")
+                    else:
+                        st.warning("本次未连通接口，已回退本地快照。")
+                    dns = stats.get("dns", {}) if isinstance(stats, dict) else {}
+                    fail_hosts = dns.get("fail_hosts", []) if isinstance(dns, dict) else []
+                    if network_mode:
+                        st.caption(f"更新通道: {network_mode}")
+                    if fail_hosts:
+                        st.caption(f"DNS失败主机: {', '.join([_safe_str(x) for x in fail_hosts])}")
                 else:
                     st.success(
                         f"更新完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
                     )
+                    if bool(stats.get("base_fallback", False)):
+                        st.caption("本次行情快照拉取失败，已复用本地快照并继续执行深度补充。")
                     st.caption(f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ 重抓: {int(stats.get('cache_miss', 0) or 0)}")
                 st.session_state["flt_result"] = None
             except Exception as exc:
@@ -1733,11 +1750,24 @@ def _render_filter_ops_panel() -> None:
                 if bool(stats.get("skipped", False)):
                     st.info(_safe_str(stats.get("reason", "周更间隔未到，本次跳过")))
                 elif bool(stats.get("fallback", False)):
-                    st.warning("周更回退到本地快照。")
+                    err_type = _safe_str(stats.get("error_type", ""))
+                    network_mode = _safe_str(stats.get("network_mode", ""))
+                    if err_type == "dns":
+                        st.warning("周更未连通接口（DNS不可达），已回退本地快照。")
+                    else:
+                        st.warning("周更回退到本地快照。")
+                    dns = stats.get("dns", {}) if isinstance(stats, dict) else {}
+                    fail_hosts = dns.get("fail_hosts", []) if isinstance(dns, dict) else []
+                    if network_mode:
+                        st.caption(f"更新通道: {network_mode}")
+                    if fail_hosts:
+                        st.caption(f"DNS失败主机: {', '.join([_safe_str(x) for x in fail_hosts])}")
                 else:
                     st.success(
                         f"周更完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
                     )
+                    if bool(stats.get("base_fallback", False)):
+                        st.caption("周更行情快照拉取失败，已复用本地快照并继续执行深度补充。")
                 st.session_state["flt_result"] = None
             except Exception as exc:
                 st.error(f"周更失败: {exc}")
@@ -1754,7 +1784,10 @@ def _render_filter_ops_panel() -> None:
                 if bool(result.get("skipped", False)):
                     st.error(_safe_str(result.get("reason", "本次未执行首轮建库推进。")))
                     dns = result.get("dns", {}) if isinstance(result, dict) else {}
+                    network_mode = _safe_str(result.get("network_mode", ""))
                     fail_hosts = dns.get("fail_hosts", []) if isinstance(dns, dict) else []
+                    if network_mode:
+                        st.caption(f"更新通道: {network_mode}")
                     if fail_hosts:
                         st.caption(f"DNS失败主机: {', '.join([_safe_str(x) for x in fail_hosts])}")
                 elif bool(result.get("fallback", False)):
@@ -1773,10 +1806,16 @@ def _render_filter_ops_panel() -> None:
 
     if u4.button("检测数据源DNS", use_container_width=True, key="flt_ops_dns_check"):
         dns = filter_check_market_data_dns()
+        network_mode = _safe_str(dns.get("network_mode", ""))
+        transport_ok = bool(dns.get("transport_ok", False))
         if bool(dns.get("ok")):
             st.success(f"DNS可用：{', '.join([_safe_str(x) for x in dns.get('ok_hosts', [])])}")
+            st.caption(f"更新通道: {network_mode or 'direct'}")
+        elif transport_ok:
+            st.warning("DNS不可达，但代理通道可用；可继续尝试更新。")
+            st.caption(f"更新通道: {network_mode or 'proxy'}")
         else:
-            st.error("DNS不可用：当前无法连通东财行情主机。")
+            st.error("DNS与代理通道均不可用：当前无法连通东财行情主机。")
             fail_hosts = dns.get("fail_hosts", []) if isinstance(dns, dict) else []
             if fail_hosts:
                 st.caption(f"失败主机: {', '.join([_safe_str(x) for x in fail_hosts])}")
@@ -1868,12 +1907,27 @@ def _render_filter_page():
                         force_refresh=bool(force_refresh),
                     )
                     if bool(stats.get("fallback", False)):
-                        st.warning(
-                            "本次未连通东财接口，已回退为本地快照（未覆盖旧数据）。"
-                            "请检查系统代理/VPN后再重试。"
-                        )
+                        err_type = _safe_str(stats.get("error_type", ""))
+                        network_mode = _safe_str(stats.get("network_mode", ""))
+                        if err_type == "dns":
+                            st.warning("本次未连通接口（DNS不可达），已回退本地快照（未覆盖旧数据）。")
+                        elif err_type == "proxy":
+                            st.warning("本次接口受代理影响，已回退本地快照（未覆盖旧数据）。")
+                        else:
+                            st.warning(
+                                "本次未连通东财接口，已回退为本地快照（未覆盖旧数据）。"
+                                "请检查系统代理/VPN后再重试。"
+                            )
+                        dns = stats.get("dns", {}) if isinstance(stats, dict) else {}
+                        fail_hosts = dns.get("fail_hosts", []) if isinstance(dns, dict) else []
+                        if network_mode:
+                            st.caption(f"更新通道: {network_mode}")
+                        if fail_hosts:
+                            st.caption(f"DNS失败主机: {', '.join([_safe_str(x) for x in fail_hosts])}")
                     else:
                         st.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只")
+                        if bool(stats.get("base_fallback", False)):
+                            st.caption("本次行情快照拉取失败，已复用本地快照并继续执行深度补充。")
                     st.session_state["flt_result"] = None
                     st.rerun()
                 except Exception as exc:
