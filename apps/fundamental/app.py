@@ -8,7 +8,7 @@ import sys
 import time as pytime
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 import streamlit as st
@@ -439,6 +439,48 @@ def _selected_row(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return rows[0] if rows else {}
 
 
+def _parse_analysis_time(value: str) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%m-%d %H:%M:%S", "%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            if fmt.startswith("%m-%d"):
+                now = datetime.now()
+                dt = dt.replace(year=now.year)
+            return dt
+        except Exception:
+            continue
+    return None
+
+
+def _render_live_status_content() -> None:
+    rows: List[Dict[str, Any]] = st.session_state.get("fnd_rows", [])
+    if not rows:
+        return
+    row = _selected_row(rows)
+    analysis_at = str(row.get("analysis_at", "") or "")
+    dt = _parse_analysis_time(analysis_at)
+    age_minutes: Optional[float] = None
+    if dt is not None:
+        age_minutes = max(0.0, (datetime.now() - dt).total_seconds() / 60.0)
+
+    st.caption("局部刷新区（仅刷新当前块，不重绘整页）")
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.0, 1.2], gap="small")
+    c1.metric("当前时钟", datetime.now().strftime("%H:%M:%S"))
+    c2.metric("数据年龄", f"{age_minutes:.1f} 分钟" if age_minutes is not None else "--")
+    c3.metric("当前标的", str(row.get("code", "--")))
+    if c4.button("局部刷新（缓存优先）", key="fnd_soft_refresh"):
+        _refresh_rows(force_refresh=False)
+        st.toast("已执行局部刷新")
+
+
+@st.fragment(run_every="30s")
+def _render_live_status_fragment() -> None:
+    _render_live_status_content()
+
+
 def _render_overview(rows: List[Dict[str, Any]]) -> None:
     st.subheader("股票列表")
     df = build_overview_table(rows).copy()
@@ -714,6 +756,12 @@ def _render_page() -> None:
             ("当前结论", _clean_text_no_na(str(row.get("conclusion", "观察")))),
         )
     )
+    live_refresh_on = st.toggle("局部自动刷新研究状态", value=True, key="fnd_live_refresh_toggle")
+    if live_refresh_on:
+        _render_live_status_fragment()
+    else:
+        _render_live_status_content()
+    st.divider()
     _render_overview(rows)
     st.divider()
 

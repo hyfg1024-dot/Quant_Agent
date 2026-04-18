@@ -16,9 +16,13 @@ try:
     import streamlit as st
 except Exception:  # pragma: no cover
     st = None  # type: ignore[assignment]
+try:
+    from slow_engine import fetch_realtime_quote as _fetch_quote_via_provider
+except Exception:  # pragma: no cover
+    _fetch_quote_via_provider = None  # type: ignore[assignment]
 
 
-APP_VERSION = "FND-20260416-03"
+APP_VERSION = "FND-20260418-04"
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
@@ -1150,12 +1154,19 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     # 多源估值兜底：东方财富直连 + 腾讯快照 + 分红详情
     em_metrics = _fetch_metrics_from_eastmoney_direct(code) if not _is_hk_symbol(code) else {}
     tx_metrics = _fetch_metrics_from_tencent(code)
+    provider_quote: Dict[str, Any] = {}
+    if callable(_fetch_quote_via_provider):
+        try:
+            provider_quote = _fetch_quote_via_provider(code) or {}
+        except Exception:
+            provider_quote = {}
     dy_em = _fetch_dividend_yield_from_em(code) if not _is_hk_symbol(code) else None
 
     pe_dynamic = _coalesce_number(
         pe_dynamic,
         em_metrics.get("pe_dynamic"),
         tx_metrics.get("pe_dynamic"),
+        _normalize_pe_value(provider_quote.get("pe_dynamic")),
         _normalize_pe_value(stale_cache.get("pe_dynamic")),
     )
     pe_static = _coalesce_number(
@@ -1169,6 +1180,7 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
         pe_ttm,
         em_metrics.get("pe_ttm"),
         tx_metrics.get("pe_ttm"),
+        _normalize_pe_value(provider_quote.get("pe_ttm")),
         _normalize_pe_value(stale_cache.get("pe_ttm")),
         pe_dynamic,
         pe_static,
@@ -1177,6 +1189,7 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
         pb,
         em_metrics.get("pb"),
         tx_metrics.get("pb"),
+        _normalize_pb_value(provider_quote.get("pb")),
         _normalize_pb_value(stale_cache.get("pb")),
     )
     dividend_yield = _coalesce_number(

@@ -59,6 +59,22 @@ python3 daemon/alert_worker.py --once --force
 python3 daemon/alert_worker.py
 ```
 
+后台常驻（推荐）：
+
+```bash
+cd /path/to/Quant_Agent
+mkdir -p logs
+nohup python3 daemon/alert_worker.py > logs/alert_worker.out 2>&1 &
+echo $! > logs/alert_worker.pid
+tail -f logs/alert_worker.out
+```
+
+停止守护进程：
+
+```bash
+kill "$(cat logs/alert_worker.pid)"
+```
+
 规则文件：`config/alert_rules.yaml`
 
 ## 目录结构
@@ -99,4 +115,3 @@ Quant_Agent/
 ```bash
 PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m compileall -q apps shared daemon
 ```
-
