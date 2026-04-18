@@ -3,6 +3,9 @@
 **/__pycache__/
 **/*.pyc
 **/data/*.db
+**/*.duckdb
+**/*.duckdb.wal
+**/*.duckdb.tmp
 **/data/local_user_prefs.json
 **/data/deepseek_analysis_cache.json
 **/data/deepseek_delta_cache.json
@@ -14,3 +17,13 @@
 **/apps/filter/data/cache/
 **/apps/filter/data/filter_templates.json
 **/apps/filter/data/manual_flags.json
+
+# Runtime / generated artifacts (must stay local)
+data/backups/
+data/quant_system.duckdb
+data/analysis_jobs/
+daemon/.alert_state.json
+apps/backtest/paper_trades/
+apps/backtest/reports/
+apps/backtest/data/
+apps/backtest/logs/
