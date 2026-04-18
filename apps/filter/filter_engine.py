@@ -1315,6 +1315,7 @@ def get_baseline_build_progress(market_scope: str = "AH") -> Dict[str, Any]:
     """
     scope = _safe_str(market_scope).upper() or "AH"
     df = load_snapshot()
+    meta = get_snapshot_meta()
     if df is None or df.empty:
         return {
             "scope": scope,
@@ -1342,6 +1343,13 @@ def get_baseline_build_progress(market_scope: str = "AH") -> Dict[str, Any]:
 
     eligible_df = df[eligible_mask].copy()
     eligible_total = int(len(eligible_df))
+    hw_key = "baseline_target_highwater_A" if effective_scope == "A" else "baseline_target_highwater_HK"
+    try:
+        hw_total = int(_to_float(meta.get(hw_key)) or 0)
+    except Exception:
+        hw_total = 0
+    if hw_total > eligible_total:
+        eligible_total = hw_total
     if "data_quality" in eligible_df.columns:
         dq = eligible_df["data_quality"].astype(str).str.lower().str.strip()
         enriched_done = int(((dq == "full") | (dq == "partial")).sum())
@@ -1420,6 +1428,7 @@ def refresh_market_snapshot(
 ) -> Dict[str, Any]:
     init_db()
     scope = _safe_str(market_scope).upper() or "A"
+    existed_snapshot = load_snapshot()
     dns = check_market_data_dns()
     network_mode = _resolve_market_network_mode(force=True)
     attempt_mode = network_mode if network_mode in {"direct", "proxy", "surge_local"} else "auto"
@@ -1474,6 +1483,65 @@ def refresh_market_snapshot(
         .sort_values(by=["total_mv", "code"], ascending=[False, True], na_position="last")
         .reset_index(drop=True)
     )
+
+    # 防缩容保护：当接口返回不完整分页时，禁止用异常偏小的快照覆盖主表
+    if (not base_fallback) and (max_stocks <= 0) and (existed_snapshot is not None) and (not existed_snapshot.empty):
+        prev_df = existed_snapshot.copy()
+        if "market" in prev_df.columns:
+            prev_df["market"] = prev_df["market"].astype(str).str.upper()
+        else:
+            prev_df["market"] = "A"
+
+        def _scope_mask(one: pd.DataFrame, sc: str) -> pd.Series:
+            mkt = one["market"].astype(str).str.upper()
+            if sc in {"AH", "ALL"}:
+                return mkt.isin(["A", "HK"])
+            if sc == "HK":
+                return mkt == "HK"
+            return mkt == "A"
+
+        prev_scope_df = prev_df[_scope_mask(prev_df, scope)].copy()
+        new_scope_df = df[_scope_mask(df, scope)].copy()
+        prev_scope_count = int(len(prev_scope_df))
+        new_scope_count = int(len(new_scope_df))
+
+        # 先做“并集保底”：保留历史已有代码，避免因单次分页缺失导致样本骤降
+        if new_scope_count < prev_scope_count:
+            old_only = prev_scope_df.merge(
+                new_scope_df[["market", "code"]].drop_duplicates(),
+                on=["market", "code"],
+                how="left",
+                indicator=True,
+            )
+            old_only = old_only[old_only["_merge"] == "left_only"].drop(columns=["_merge"], errors="ignore")
+            if not old_only.empty:
+                df = (
+                    pd.concat([new_scope_df, old_only], ignore_index=True)
+                    .drop_duplicates(subset=["market", "code"], keep="first")
+                    .sort_values(by=["total_mv", "code"], ascending=[False, True], na_position="last")
+                    .reset_index(drop=True)
+                )
+                new_scope_df = df.copy()
+                new_scope_count = int(len(new_scope_df))
+                base_fallback = True
+                base_error = (
+                    f"触发并集保底: 新快照 {int(len(df) - len(old_only))} 只，"
+                    f"补回历史缺失 {len(old_only)} 只，当前保留 {new_scope_count} 只"
+                )
+
+        # 低于历史规模 80% 且减少超过 600 只，视为疑似分页不完整
+        shrink_suspect = (
+            prev_scope_count > 0
+            and new_scope_count < int(prev_scope_count * 0.8)
+            and (prev_scope_count - new_scope_count) >= 600
+        )
+        if shrink_suspect:
+            df = prev_scope_df.copy()
+            base_fallback = True
+            base_error = (
+                f"触发防缩容保护: 新快照 {new_scope_count} 只，低于历史 {prev_scope_count} 只；"
+                "已保留上一版完整快照并继续深补"
+            )
 
     if max_stocks and max_stocks > 0:
         df = df.head(int(max_stocks)).copy()
@@ -1642,6 +1710,18 @@ def refresh_market_snapshot(
     _snapshot_meta_set("last_refresh_error", base_error if base_fallback else "")
     _snapshot_meta_set("last_refresh_error_at", now_text if base_fallback else "")
     _snapshot_meta_set("last_scope", scope)
+    a_count = int((save_df["market"].astype(str).str.upper() == "A").sum()) if "market" in save_df.columns else 0
+    hk_count = int((save_df["market"].astype(str).str.upper() == "HK").sum()) if "market" in save_df.columns else 0
+    try:
+        prev_hw_a = int(_to_float(meta0.get("baseline_target_highwater_A")) or 0)
+    except Exception:
+        prev_hw_a = 0
+    try:
+        prev_hw_hk = int(_to_float(meta0.get("baseline_target_highwater_HK")) or 0)
+    except Exception:
+        prev_hw_hk = 0
+    _snapshot_meta_set("baseline_target_highwater_A", str(max(prev_hw_a, a_count)))
+    _snapshot_meta_set("baseline_target_highwater_HK", str(max(prev_hw_hk, hk_count)))
     if rotate_enrich and enrich_n > 0 and eligible_total > 0:
         _snapshot_meta_set(cursor_key, str((start_idx + enrich_n) % eligible_total))
         _snapshot_meta_set("enrich_cursor_index", str((start_idx + enrich_n) % eligible_total))
