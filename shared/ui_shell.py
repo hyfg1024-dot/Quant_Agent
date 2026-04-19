@@ -8,6 +8,7 @@ from typing import Any, Dict, Sequence
 import streamlit as st
 import streamlit.components.v1 as components
 
+from shared.macro_cycle import MacroCycleAnalyzer
 from shared.market_sentiment import MarketSentimentEngine
 
 
@@ -112,6 +113,7 @@ _SHELLS: dict[str, ShellMeta] = {
 
 _NAV_ORDER = ("filter", "fundamental", "trading", "backtest", "paper", "portfolio")
 _MARKET_SENTIMENT_ENGINE = MarketSentimentEngine()
+_MACRO_CYCLE_ANALYZER = MacroCycleAnalyzer()
 
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -136,6 +138,20 @@ def _get_market_sentiment_snapshot() -> Dict[str, Any]:
             "max_board_3d": 0,
             "updated_at": "",
             "fetch_error": str(exc),
+        }
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_macro_cycle_snapshot() -> Dict[str, Any]:
+    try:
+        return _MACRO_CYCLE_ANALYZER.get_cycle_position()
+    except Exception as exc:
+        return {
+            "cycle_phase": "数据不可用",
+            "investment_stance": "持有观望",
+            "confidence": 0.0,
+            "details": {},
+            "summary": f"宏观数据不可用（A股口径）: {exc}",
         }
 
 
@@ -219,6 +235,71 @@ def _render_market_sentiment_bar() -> None:
         st.caption(f"情绪数据回退说明: {short_err}")
         with st.expander("查看完整回退日志", expanded=False):
             st.code(fetch_error_raw)
+
+
+def _render_macro_cycle_bar() -> None:
+    snap = _get_macro_cycle_snapshot()
+    cycle_phase = str(snap.get("cycle_phase", "数据不可用") or "数据不可用")
+    investment_stance = str(snap.get("investment_stance", "持有观望") or "持有观望")
+    confidence = float(snap.get("confidence", 0.0) or 0.0)
+    summary = str(snap.get("summary", "") or "")
+
+    details = snap.get("details", {})
+    details = details if isinstance(details, dict) else {}
+    pmi = details.get("pmi", {})
+    credit = details.get("credit", {})
+    valuation = details.get("valuation", {})
+    pmi = pmi if isinstance(pmi, dict) else {}
+    credit = credit if isinstance(credit, dict) else {}
+    valuation = valuation if isinstance(valuation, dict) else {}
+
+    def _to_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    pmi_val = _to_float(pmi.get("latest_pmi"))
+    pmi_trend = str(pmi.get("trend", "") or "")
+    trend_arrow = {
+        "expanding": "↑",
+        "contracting": "↓",
+        "turning_up": "↗",
+        "turning_down": "↘",
+    }.get(pmi_trend, "")
+    pmi_text = f"PMI {pmi_val:.1f}{trend_arrow}" if pmi_val is not None else "PMI 数据不可用"
+
+    scissors_gap = _to_float(credit.get("scissors_gap"))
+    gap_text = f"M1-M2 剪刀差 {scissors_gap:+.1f}%" if scissors_gap is not None else "M1-M2 剪刀差 数据不可用"
+
+    pe_pct = _to_float(valuation.get("csi300_pe_percentile"))
+    pe_text = f"沪深300 PE 分位 {pe_pct:.0f}%" if pe_pct is not None else "沪深300 PE 分位 数据不可用"
+
+    if cycle_phase == "过热晚期":
+        banner_class = "overheat"
+    elif cycle_phase == "衰退底部":
+        banner_class = "panic"
+    else:
+        banner_class = "neutral"
+
+    line = f"📊 宏观周期：{cycle_phase} | {pmi_text} | {gap_text} | {pe_text}"
+    sub_text = f"策略建议：{investment_stance} | 置信度 {confidence:.0f}% | 仅适用于A股市场"
+    if summary:
+        sub_text = f"{sub_text} | {summary}"
+
+    st.markdown(
+        (
+            "<section class='qs-sentiment-wrap qs-macro-wrap'>"
+            f"<div class='qs-sentiment-banner {banner_class}'>"
+            f"<div class='qs-macro-line'>{escape(line)}</div>"
+            f"<div class='qs-sentiment-sub'>{escape(sub_text)}</div>"
+            "</div>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def _format_sentiment_error(error: str) -> str:
@@ -638,6 +719,16 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
       margin-top: 0.3rem;
       font-size: 0.84rem;
       color: rgba(244, 229, 220, 0.82);
+      letter-spacing: 0.01em;
+    }}
+    .qs-macro-wrap {{
+      margin-top: -0.35rem;
+    }}
+    .qs-macro-line {{
+      font-size: 0.95rem;
+      font-weight: 780;
+      color: rgba(255, 247, 240, 0.96);
+      line-height: 1.52;
       letter-spacing: 0.01em;
     }}
     .st-key-qs_top_nav_row {{
@@ -1212,6 +1303,7 @@ def render_app_shell(
     """
     st.markdown(_shell_style(meta, active_page), unsafe_allow_html=True)
     _render_market_sentiment_bar()
+    _render_macro_cycle_bar()
     st.markdown(shell_html, unsafe_allow_html=True)
 
 

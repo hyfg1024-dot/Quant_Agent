@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import sys
@@ -348,6 +349,39 @@ def _clean_text_no_na(text: str) -> str:
     return out
 
 
+def _to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        num = float(value)
+        if math.isnan(num):
+            return None
+        return num
+    except Exception:
+        return None
+
+
+def _fmt_num(value: Any, digits: int = 2, suffix: str = "") -> str:
+    num = _to_float(value)
+    if num is None:
+        return "--"
+    return f"{num:,.{digits}f}{suffix}"
+
+
+def _fmt_pct_point(value: Any, digits: int = 2) -> str:
+    num = _to_float(value)
+    if num is None:
+        return "--"
+    return f"{num:.{digits}f}%"
+
+
+def _fmt_pct_ratio(value: Any, digits: int = 2) -> str:
+    num = _to_float(value)
+    if num is None:
+        return "--"
+    return f"{num * 100:.{digits}f}%"
+
+
 def _split_sentences(text: str) -> List[str]:
     raw = _clean_text_no_na(text).replace("\n", "")
     parts = [x.strip() for x in re.split(r"(?<=[。！？；])", raw) if x.strip()]
@@ -552,6 +586,65 @@ def _render_dimension_cards(row: Dict[str, Any]) -> None:
 """,
                     unsafe_allow_html=True,
                 )
+
+
+def _render_valuation(row: Dict[str, Any]) -> None:
+    valuation = row.get("valuation_report") or {}
+    if not isinstance(valuation, dict) or not valuation:
+        st.info("估值引擎暂无可用结果（需价格/现金流等字段）。")
+        return
+
+    dcf = valuation.get("dcf") or {}
+    ddm = valuation.get("ddm") or {}
+    fcf = valuation.get("fcf") or {}
+    payout = valuation.get("payout") or {}
+    scenarios = dcf.get("scenarios") or {}
+    snapshot = valuation.get("input_snapshot") or {}
+
+    c1, c2, c3, c4 = st.columns(4, gap="small")
+    safety_margin = _to_float(dcf.get("safety_margin_pct"))
+    c1.metric(
+        "DCF内在价值(每股)",
+        _fmt_num(dcf.get("intrinsic_value_per_share")),
+        delta=(f"{safety_margin:+.2f}% 安全边际" if safety_margin is not None else None),
+    )
+    implied_yield = _to_float(ddm.get("dividend_yield_implied"))
+    c2.metric(
+        "DDM估值(每股)",
+        _fmt_num(ddm.get("ddm_value")),
+        delta=(f"隐含股息率 {implied_yield:.2f}%" if implied_yield is not None else None),
+    )
+    c3.metric(
+        "FCF收益率",
+        _fmt_pct_point(fcf.get("fcf_yield_pct")),
+        delta=(str(fcf.get("fcf_quality") or "差")),
+    )
+    payout_ratio = _to_float(payout.get("payout_ratio"))
+    fcf_cover = _to_float(payout.get("fcf_coverage"))
+    c4.metric(
+        "分红可持续",
+        "是" if bool(payout.get("sustainable")) else "否",
+        delta=(
+            f"派息率 {_fmt_pct_ratio(payout_ratio)} / 覆盖 {fcf_cover:.2f}x"
+            if (payout_ratio is not None and fcf_cover is not None)
+            else None
+        ),
+    )
+
+    st.markdown("**DCF 情景估值（WACC ±2%）**")
+    s1, s2, s3 = st.columns(3, gap="small")
+    s1.metric("乐观", _fmt_num(scenarios.get("optimistic")))
+    s2.metric("中性", _fmt_num(scenarios.get("neutral")))
+    s3.metric("悲观", _fmt_num(scenarios.get("pessimistic")))
+
+    st.caption(
+        "输入快照："
+        f"现价 {_fmt_num(snapshot.get('current_price'))}，"
+        f"总市值 {_fmt_num(snapshot.get('market_cap'))}，"
+        f"EPS {_fmt_num(snapshot.get('eps'))}，"
+        f"DPS {_fmt_num(snapshot.get('dividend_per_share'))}，"
+        f"FCF估算 {_fmt_num(fcf.get('fcf'))}"
+    )
 
 
 def _render_summary(row: Dict[str, Any]) -> None:
@@ -781,6 +874,14 @@ def _render_page() -> None:
         pills=("独立维度卡", "统一阅读节奏", "便于横向比较"),
     )
     _render_dimension_cards(row)
+    st.divider()
+    render_section_intro(
+        "估值引擎",
+        "把 DCF、DDM、FCF 收益率和分红可持续性放在一起，先看安全边际，再看现金流与分红质量。",
+        kicker="Valuation",
+        pills=("DCF 情景", "DDM 对照", "FCF 质量"),
+    )
+    _render_valuation(row)
     st.divider()
     render_section_intro(
         "总结与输出",
