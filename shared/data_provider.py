@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
+from shared.utils import to_float
 
 
 class DataProviderError(RuntimeError):
@@ -19,16 +20,7 @@ class ProviderTimeoutError(DataProviderError):
     """数据源超时。"""
 
 
-def _to_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if text in {"", "-", "--", "None", "nan", "NaN"}:
-        return None
-    try:
-        return float(text)
-    except Exception:
-        return None
+_to_float = to_float
 
 
 def _safe_list(value: Any) -> list:

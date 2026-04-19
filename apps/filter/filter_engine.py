@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 import requests
+from shared.utils import to_float
 
 CURRENT_DIR = Path(__file__).resolve().parent
 FUNDAMENTAL_DIR = CURRENT_DIR.parent / "fundamental"
@@ -173,23 +174,7 @@ def _connect() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
 
-def _to_float(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        try:
-            if pd.isna(v):
-                return None
-        except Exception:
-            pass
-        return float(v)
-    text = str(v).strip().replace(",", "")
-    if text in {"", "-", "--", "nan", "NaN", "None"}:
-        return None
-    try:
-        return float(text)
-    except Exception:
-        return None
+_to_float = to_float
 
 
 def _to_mv_100m(v: Any) -> Optional[float]:
@@ -1546,6 +1531,85 @@ def refresh_market_snapshot(
     if max_stocks and max_stocks > 0:
         df = df.head(int(max_stocks)).copy()
 
+    # 保留历史已深补字段：避免单次接口不完整时把已补齐数据覆盖回空值
+    if existed_snapshot is not None and (not existed_snapshot.empty):
+        prev_df = existed_snapshot.copy()
+        if "market" not in prev_df.columns:
+            prev_df["market"] = "A"
+        prev_df["market"] = prev_df["market"].astype(str).str.upper()
+
+        preserve_cols = [
+            "industry",
+            "is_st",
+            "close_price",
+            "price_change_pct",
+            "amount",
+            "pe_dynamic",
+            "pe_static",
+            "pe_ttm",
+            "pb",
+            "dividend_yield",
+            "total_mv",
+            "float_mv",
+            "turnover_ratio",
+            "volume_ratio",
+            "roe",
+            "gross_margin",
+            "net_margin",
+            "asset_liability_ratio",
+            "current_ratio",
+            "operating_cashflow_3y",
+            "receivable_revenue_ratio",
+            "goodwill_equity_ratio",
+            "interest_debt_asset_ratio",
+            "ev_ebitda",
+            "revenue_growth",
+            "profit_growth",
+            "revenue_cagr_5y",
+            "profit_cagr_5y",
+            "roe_avg_5y",
+            "debt_ratio_avg_5y",
+            "gross_margin_avg_5y",
+            "debt_ratio_change_5y",
+            "gross_margin_change_5y",
+            "ocf_positive_years_5y",
+            "investigation_flag",
+            "penalty_flag",
+            "fund_occupation_flag",
+            "illegal_reduce_flag",
+            "pledge_ratio",
+            "no_dividend_5y_flag",
+            "audit_change_count",
+            "audit_opinion",
+            "sunset_industry_flag",
+            "total_score",
+            "conclusion",
+            "coverage_ratio",
+            "data_quality",
+            "enriched_at",
+            "source_note",
+        ]
+        keep_cols = ["market", "code"] + [c for c in preserve_cols if c in prev_df.columns]
+        prev_keep = (
+            prev_df[keep_cols]
+            .drop_duplicates(subset=["market", "code"], keep="first")
+            .copy()
+        )
+        if not prev_keep.empty:
+            df = df.merge(prev_keep, on=["market", "code"], how="left", suffixes=("", "__prev"))
+            for col in preserve_cols:
+                prev_col = f"{col}__prev"
+                if col in df.columns and prev_col in df.columns:
+                    try:
+                        df[col] = df[col].where(df[col].notna(), df[prev_col])
+                    except Exception:
+                        pass
+                elif (col not in df.columns) and (prev_col in df.columns):
+                    df[col] = df[prev_col]
+            drop_prev = [c for c in df.columns if c.endswith("__prev")]
+            if drop_prev:
+                df = df.drop(columns=drop_prev, errors="ignore")
+
     manual_flags = _load_manual_flags()
 
     enrich_n = max(0, min(int(enrich_top_n), len(df)))
@@ -1573,7 +1637,8 @@ def refresh_market_snapshot(
         else:
             target_indices = eligible_indices[:enrich_n]
 
-    df["enriched_at"] = None
+    if "enriched_at" not in df.columns:
+        df["enriched_at"] = None
     consecutive_fail = 0
     for idx in target_indices:
         code = str(df.at[idx, "code"])

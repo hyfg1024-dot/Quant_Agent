@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -9,59 +8,11 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from shared.utils import normalize_flow_to_yi, to_float, to_int
 
-
-def _to_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float, np.number)):
-        if pd.isna(value):
-            return None
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    text = text.replace(",", "").replace("%", "")
-    unit_mul = 1.0
-    if text.endswith("亿"):
-        unit_mul = 1.0
-        text = text[:-1]
-    elif text.endswith("万"):
-        unit_mul = 0.0001
-        text = text[:-1]
-    m = re.search(r"[-+]?\d+(\.\d+)?", text)
-    if not m:
-        return None
-    try:
-        return float(m.group(0)) * unit_mul
-    except Exception:
-        return None
-
-
-def _to_int(value: Any) -> int:
-    f = _to_float(value)
-    if f is None:
-        return 0
-    return int(round(f))
-
-
-def _normalize_flow_to_yi(value: Any) -> Optional[float]:
-    """
-    Normalize fund flow to unit "亿".
-    Heuristic:
-      - with explicit 亿/万 text -> handled by _to_float
-      - large plain number (likely 元) -> divide by 1e8
-      - medium plain number (likely 万) -> divide by 1e4
-    """
-    raw = _to_float(value)
-    if raw is None:
-        return None
-    abs_v = abs(raw)
-    if abs_v >= 1_000_000:
-        return raw / 100_000_000.0
-    if abs_v >= 10_000 and abs_v < 1_000_000:
-        return raw / 10_000.0
-    return raw
+_to_float = to_float
+_to_int = to_int
+_normalize_flow_to_yi = normalize_flow_to_yi
 
 
 @dataclass

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 import requests
+from shared.utils import to_float
 try:
     import streamlit as st
 except Exception:  # pragma: no cover
@@ -20,9 +21,15 @@ try:
     from slow_engine import fetch_realtime_quote as _fetch_quote_via_provider
 except Exception:  # pragma: no cover
     _fetch_quote_via_provider = None  # type: ignore[assignment]
+try:
+    from shared.valuation_engine import compute_full_valuation
+except Exception:  # pragma: no cover
+    compute_full_valuation = None  # type: ignore[assignment]
+
+_to_float = to_float
 
 
-APP_VERSION = "FND-20260418-04"
+APP_VERSION = "FND-20260419-01"
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
@@ -1161,6 +1168,19 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
         except Exception:
             provider_quote = {}
     dy_em = _fetch_dividend_yield_from_em(code) if not _is_hk_symbol(code) else None
+    current_price = _coalesce_number(
+        provider_quote.get("current_price"),
+        _pick_profile_number(p, ["最新价", "现价", "当前价", "收盘价"]),
+        stale_cache.get("current_price"),
+    )
+    latest_net_profit = _coalesce_number(
+        profit_series[0] if profit_series else None,
+        stale_cache.get("net_profit"),
+    )
+    total_shares = _coalesce_number(
+        _pick_profile_number(p, ["总股本", "总股本(股)", "流通股本", "流通股本(股)"]),
+        stale_cache.get("total_shares"),
+    )
 
     pe_dynamic = _coalesce_number(
         pe_dynamic,
@@ -1241,6 +1261,39 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     if dividend_yield is None:
         data_warnings.append("股息率 暂不可用")
 
+    valuation_report: Dict[str, Any] = {}
+    if callable(compute_full_valuation):
+        try:
+            valuation_report = compute_full_valuation(
+                {
+                    "code": code,
+                    "name": result.get("name", name or code),
+                    "pe_ttm": pe_ttm,
+                    "pb": pb,
+                    "dividend_yield": dividend_yield,
+                    "roe": roe,
+                    "gross_margin": gross_margin,
+                    "net_margin": net_margin,
+                    "debt_ratio": debt_ratio,
+                    "ocf_sum_3y": ocf_sum_3y,
+                    "ocf_per_share": ocf_per_share,
+                    "revenue_growth": revenue_growth,
+                    "profit_growth": profit_growth,
+                    "revenue_cagr_5y": revenue_cagr_5y,
+                    "profit_cagr_5y": profit_cagr_5y,
+                    "total_mv": total_mv,
+                    "retained_eps": retained_eps,
+                    "net_profit": latest_net_profit,
+                    "total_shares": total_shares,
+                },
+                current_price=current_price,
+            )
+        except Exception as exc:
+            data_warnings.append(f"估值引擎计算失败: {exc}")
+            valuation_report = {}
+    elif isinstance(stale_cache.get("valuation_report"), dict):
+        valuation_report = stale_cache.get("valuation_report") or {}
+
     dimensions = [
         _score_business_quality(gross_margin, net_margin),
         _score_profitability(roe, pe_ttm),
@@ -1280,7 +1333,10 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
             "pe_ttm": pe_ttm,
             "pb": pb,
             "dividend_yield": dividend_yield,
+            "current_price": current_price,
             "total_mv": total_mv,
+            "net_profit": latest_net_profit,
+            "total_shares": total_shares,
             "gross_margin": gross_margin,
             "net_margin": net_margin,
             "roe": roe,
@@ -1322,6 +1378,7 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
             "research_items": catalyst_ctx.get("research_items", []),
             "news_fetch_details": catalyst_ctx.get("details", {}),
             "fund_deepseek_prompt": build_fund_deepseek_prompt(news_catalysts, research_summary),
+            "valuation_report": valuation_report,
             "data_warnings": data_warnings,
         }
     )

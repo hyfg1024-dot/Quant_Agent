@@ -1,0 +1,21 @@
+scan:
+  schedule: "18:00"  # 每天收盘后运行
+  auto_expand_from_filter: true
+  filter_min_score: 60
+  composite_threshold: 60
+  max_candidates: 200
+
+watchlist:
+  - code: "601088"
+    name: "中国神华"
+  - code: "600036"
+    name: "招商银行"
+
+weights:
+  inflection: 0.35
+  bottom: 0.20
+  valuation: 0.30
+  capital: 0.15
+
+push:
+  channel: telegram  # 复用 alert_rules.yaml 的 push 配置
