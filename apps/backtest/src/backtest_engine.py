@@ -50,7 +50,33 @@ class BacktestEngine:
         """Execute backtest from config and return full result payload."""
         start = str(self.config.backtest.start_date)
         end = str(self.config.backtest.end_date)
-        all_codes = sorted({p.code for p in [*self.config.long_positions, *self.config.short_positions]})
+        strategy_type = str(getattr(self.config, "strategy_type", "static") or "static").strip().lower()
+        inflection_runner = None
+        inflection_score_logs: Dict[str, pd.DataFrame] = {}
+
+        if strategy_type == "inflection":
+            try:
+                from strategies.inflection_strategy import InflectionStrategy
+            except Exception:
+                from apps.backtest.strategies.inflection_strategy import InflectionStrategy
+
+            inflection_runner = InflectionStrategy(
+                market=str(self.config.signal_universe.market),
+                pool_source=str(self.config.signal_universe.pool_source),
+                pool_size=int(self.config.signal_universe.pool_size),
+                min_score=float(self.config.inflection.min_score),
+                max_valuation_percentile=float(self.config.inflection.max_valuation_percentile),
+                top_n=int(self.config.inflection.top_n),
+                fallback_pool=list(self.config.candidate_pool),
+                logger=self.logger,
+            )
+            all_codes = sorted({code for code, _ in inflection_runner.get_candidates()})
+            if not all_codes:
+                raise RuntimeError("拐点策略候选池为空，无法回测")
+        else:
+            all_codes = sorted({p.code for p in [*self.config.long_positions, *self.config.short_positions]})
+            if not all_codes:
+                raise RuntimeError("策略未配置标的，无法回测")
 
         self.logger(f"[BT] 加载价格数据: {len(all_codes)} 个标的")
         raw_map: Dict[str, pd.DataFrame] = {}
@@ -93,13 +119,17 @@ class BacktestEngine:
 
         bench_nav = self._build_benchmark_nav(bench_raw, calendar)
 
-        long_weights, short_weights = self._resolve_weights(aligned, active_codes)
+        if strategy_type == "inflection":
+            long_weights = {c: 0.0 for c in active_codes}
+            short_weights: Dict[str, float] = {}
+        else:
+            long_weights, short_weights = self._resolve_weights(aligned, active_codes)
 
         shares: Dict[str, float] = {c: 0.0 for c in active_codes}
         entry_price: Dict[str, float] = {c: np.nan for c in active_codes}
         short_enabled: Dict[str, bool] = {c: True for c in short_weights.keys()}
 
-        long_codes = set(long_weights.keys())
+        long_codes = set(active_codes) if strategy_type == "inflection" else set(long_weights.keys())
         short_codes = set(short_weights.keys())
         cash = float(self.config.capital.total_hkd)
         init_long_cap = float(self.config.capital.total_hkd * self.config.capital.long_pct)
@@ -137,6 +167,16 @@ class BacktestEngine:
                 day_trade_fee = 0.0
                 day_borrow_fee = 0.0
                 if not strategy_terminated:
+                    if inflection_runner is not None:
+                        plan = inflection_runner.build_rebalance_plan(
+                            rebalance_date=dt,
+                            aligned_map=aligned,
+                            current_shares=shares,
+                        )
+                        long_weights = dict(plan.get("target_weights", {}))
+                        inflection_score_logs[str(dt.date())] = plan.get("score_table", pd.DataFrame())
+                        if not plan.get("selected_codes"):
+                            warnings.append(f"{dt.date()} 拐点策略无入选标的，调仓后为空仓")
                     cash, fee_l, fee_s = self._rebalance_to_target(
                         dt=dt,
                         shares=shares,
@@ -285,6 +325,20 @@ class BacktestEngine:
             # Rebalance (monthly/weekly/daily/quarterly)
             if (not strategy_terminated) and (dt in rebalance_dates):
                 long_stop_triggered.clear()
+                if inflection_runner is not None:
+                    plan = inflection_runner.build_rebalance_plan(
+                        rebalance_date=dt,
+                        aligned_map=aligned,
+                        current_shares=shares,
+                    )
+                    long_weights = dict(plan.get("target_weights", {}))
+                    inflection_score_logs[str(dt.date())] = plan.get("score_table", pd.DataFrame())
+                    selected = list(plan.get("selected_codes", []))
+                    forced_exit = list(plan.get("forced_exit_codes", []))
+                    if not selected:
+                        warnings.append(f"{dt.date()} 拐点策略无入选标的，调仓后为空仓")
+                    if forced_exit:
+                        warnings.append(f"{dt.date()} 拐点策略触发低分卖出: {', '.join(forced_exit[:8])}")
                 cash, fee_l, fee_s = self._rebalance_to_target(
                     dt=dt,
                     shares=shares,
@@ -342,7 +396,7 @@ class BacktestEngine:
             benchmark_nav=bench_nav,
             code_contribution=pd.Series(code_contrib).sort_values(ascending=False),
             daily_costs=cost_df,
-            warnings=warnings,
+            warnings=warnings + ([f"拐点策略调仓记录: {len(inflection_score_logs)} 次"] if inflection_score_logs else []),
         )
 
     def _build_calendar(

@@ -1,0 +1,23 @@
+strategy_name: "拐点策略示例"
+description: "基于拐点评分 + 技术底部结构 + 估值分位的月度调仓策略"
+strategy_type: inflection  # 新增策略类型
+
+universe:
+  market: A  # A / HK / AH
+  pool_source: filter  # 从大过滤器结果中取候选池
+  pool_size: 100  # 候选池大小
+
+inflection:
+  min_score: 50  # 拐点评分门槛
+  max_valuation_percentile: 40  # 估值分位上限（只买便宜的）
+  top_n: 5  # 持仓数量
+  rebalance_frequency: monthly
+
+backtest:
+  start_date: 2023-01-01
+  end_date: 2025-12-31
+
+capital:
+  total_hkd: 1000000
+  long_pct: 1.0
+  short_pct: 0.0

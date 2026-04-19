@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
@@ -83,6 +83,25 @@ class SensitivityConfig:
 
 
 @dataclass
+class SignalUniverseConfig:
+    """Signal-driven strategy universe settings."""
+
+    market: str = "HK"  # A / HK / AH
+    pool_source: str = "universe"  # universe / filter
+    pool_size: int = 100
+
+
+@dataclass
+class InflectionConfig:
+    """Inflection strategy parameters."""
+
+    min_score: float = 50.0
+    max_valuation_percentile: float = 40.0
+    top_n: int = 5
+    rebalance_frequency: str = "monthly"
+
+
+@dataclass
 class EventMarker:
     """Optional timeline event marker."""
 
@@ -107,6 +126,10 @@ class StrategyConfig:
     stop_loss: StopLossConfig
     sensitivity: SensitivityConfig
     events: List[EventMarker] = field(default_factory=list)
+    strategy_type: str = "static"  # static / inflection
+    signal_universe: SignalUniverseConfig = field(default_factory=SignalUniverseConfig)
+    inflection: InflectionConfig = field(default_factory=InflectionConfig)
+    candidate_pool: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -200,6 +223,16 @@ def _parse_date(v: Any) -> date:
 
 def _normalize_code(code: str) -> str:
     return str(code).strip().upper()
+
+
+def _infer_market_from_code(code: str) -> str:
+    raw = str(code or "").strip().upper()
+    if raw.endswith(".HK"):
+        return "HK"
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) <= 5:
+        return "HK"
+    return "A"
 
 
 def _sum_weights(items: Iterable[PositionConfig]) -> float:
@@ -298,7 +331,13 @@ def load_strategy(strategy_path: Path, universe: UniverseConfig) -> StrategyConf
     """Load and validate strategy YAML."""
     raw = _load_yaml(strategy_path)
 
+    strategy_type = str(raw.get("strategy_type", "static")).strip().lower()
+    if strategy_type not in {"static", "inflection"}:
+        raise ConfigError("strategy_type 仅支持 static/inflection")
+
     strategy_name = str(raw.get("strategy_name", "")).strip()
+    if not strategy_name and strategy_type == "inflection":
+        strategy_name = "拐点策略回测"
     if not strategy_name:
         raise ConfigError("strategy_name 不能为空")
 
@@ -309,12 +348,27 @@ def load_strategy(strategy_path: Path, universe: UniverseConfig) -> StrategyConf
         raise ConfigError("backtest.start_date 必须早于 end_date")
 
     cap_raw = raw.get("capital", {}) or {}
+    long_pct = float(cap_raw.get("long_pct", 0.0))
+    short_pct = float(cap_raw.get("short_pct", 0.0))
+    if "cash_buffer_pct" in cap_raw:
+        cash_buffer_pct = float(cap_raw.get("cash_buffer_pct", 0.0))
+    else:
+        cash_buffer_pct = max(0.0, 1.0 - long_pct - short_pct)
+
+    total_hkd = cap_raw.get("total_hkd")
+    if total_hkd is not None:
+        total_rmb = float(total_hkd)
+        rmb_to_hkd_rate = 1.0
+    else:
+        total_rmb = float(cap_raw.get("total", 0.0))
+        rmb_to_hkd_rate = float(cap_raw.get("rmb_to_hkd_rate", 1.0))
+
     capital = CapitalConfig(
-        total_rmb=float(cap_raw.get("total", 0.0)),
-        rmb_to_hkd_rate=float(cap_raw.get("rmb_to_hkd_rate", 1.0)),
-        long_pct=float(cap_raw.get("long_pct", 0.0)),
-        short_pct=float(cap_raw.get("short_pct", 0.0)),
-        cash_buffer_pct=float(cap_raw.get("cash_buffer_pct", 0.0)),
+        total_rmb=total_rmb,
+        rmb_to_hkd_rate=rmb_to_hkd_rate,
+        long_pct=long_pct,
+        short_pct=short_pct,
+        cash_buffer_pct=cash_buffer_pct,
     )
     _assert_close_1(
         capital.long_pct + capital.short_pct + capital.cash_buffer_pct,
@@ -332,22 +386,67 @@ def load_strategy(strategy_path: Path, universe: UniverseConfig) -> StrategyConf
     short_positions = [
         PositionConfig(code=_normalize_code(x["code"]), weight=float(x["weight"])) for x in short_raw
     ]
-    if not long_positions:
-        raise ConfigError("long_positions 不能为空")
-    if not short_positions:
-        raise ConfigError("short_positions 不能为空")
-
-    _assert_close_1(_sum_weights(long_positions), "long_positions 权重和")
-    _assert_close_1(_sum_weights(short_positions), "short_positions 权重和")
-
     all_universe_codes = set(universe.all_stock_codes())
-    for p in [*long_positions, *short_positions]:
-        if p.code not in all_universe_codes:
-            raise ConfigError(f"策略使用了不在 universe 中的代码: {p.code}")
+
+    if strategy_type == "static":
+        if not long_positions:
+            raise ConfigError("long_positions 不能为空")
+        if not short_positions:
+            raise ConfigError("short_positions 不能为空")
+        _assert_close_1(_sum_weights(long_positions), "long_positions 权重和")
+        _assert_close_1(_sum_weights(short_positions), "short_positions 权重和")
+        for p in [*long_positions, *short_positions]:
+            if p.code not in all_universe_codes:
+                raise ConfigError(f"策略使用了不在 universe 中的代码: {p.code}")
+    else:
+        if capital.short_pct > 0:
+            raise ConfigError("inflection 策略当前仅支持多头，请将 capital.short_pct 设为 0")
+        if long_positions:
+            _assert_close_1(_sum_weights(long_positions), "long_positions 权重和")
+        if short_positions and _sum_weights(short_positions) > 0:
+            raise ConfigError("inflection 策略不支持 short_positions，请留空")
+
+    uni_raw = raw.get("universe", {}) or {}
+    signal_universe = SignalUniverseConfig(
+        market=str(uni_raw.get("market", "HK")).strip().upper(),
+        pool_source=str(uni_raw.get("pool_source", "universe")).strip().lower(),
+        pool_size=max(1, int(uni_raw.get("pool_size", 100))),
+    )
+    if signal_universe.market not in {"A", "HK", "AH"}:
+        raise ConfigError("universe.market 仅支持 A/HK/AH")
+    if signal_universe.pool_source not in {"universe", "filter"}:
+        raise ConfigError("universe.pool_source 仅支持 universe/filter")
+
+    inf_raw = raw.get("inflection", {}) or {}
+    inflection_cfg = InflectionConfig(
+        min_score=float(inf_raw.get("min_score", 50.0)),
+        max_valuation_percentile=float(inf_raw.get("max_valuation_percentile", 40.0)),
+        top_n=max(1, int(inf_raw.get("top_n", 5))),
+        rebalance_frequency=str(inf_raw.get("rebalance_frequency", "monthly")).strip().lower(),
+    )
+    if inflection_cfg.rebalance_frequency not in {"daily", "weekly", "monthly", "quarterly"}:
+        raise ConfigError("inflection.rebalance_frequency 仅支持 daily/weekly/monthly/quarterly")
+
+    candidate_pool: List[Tuple[str, str]] = []
+    if strategy_type == "inflection":
+        market_filter = signal_universe.market
+        seen_codes: set[str] = set()
+        for sec in universe.sectors:
+            for grp in sec.groups:
+                for st in grp.stocks:
+                    code = _normalize_code(st.code)
+                    mk = _infer_market_from_code(code)
+                    if market_filter != "AH" and mk != market_filter:
+                        continue
+                    if code in seen_codes:
+                        continue
+                    seen_codes.add(code)
+                    candidate_pool.append((code, st.name))
 
     reb_raw = raw.get("rebalance", {}) or {}
+    default_freq = inflection_cfg.rebalance_frequency if strategy_type == "inflection" else "monthly"
     rebalance = RebalanceConfig(
-        frequency=str(reb_raw.get("frequency", "monthly")).lower(),
+        frequency=str(reb_raw.get("frequency", default_freq)).lower(),
         day=int(reb_raw.get("day", 1)),
     )
 
@@ -389,10 +488,14 @@ def load_strategy(strategy_path: Path, universe: UniverseConfig) -> StrategyConf
         capital=capital,
         long_positions=long_positions,
         short_positions=short_positions,
-        weighting_mode=str(raw.get("weighting_mode", "manual")).lower(),
+        weighting_mode=("dynamic" if strategy_type == "inflection" else str(raw.get("weighting_mode", "manual")).lower()),
         rebalance=rebalance,
         costs=costs,
         stop_loss=stop_loss,
         sensitivity=sensitivity,
         events=events,
+        strategy_type=strategy_type,
+        signal_universe=signal_universe,
+        inflection=inflection_cfg,
+        candidate_pool=candidate_pool,
     )
