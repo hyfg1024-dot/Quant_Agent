@@ -1,0 +1,144 @@
+# 产业链映射可按需扩展：
+# - 新增节点: 直接新增一级键
+# - 新增关系: 使用 upstream/downstream/related
+# - 增加行业匹配词: aliases
+
+锂矿:
+  aliases: ["锂资源", "盐湖提锂", "锂盐"]
+  downstream: ["正极材料", "电池", "新能源汽车"]
+
+正极材料:
+  upstream: ["锂矿", "化工原料"]
+  downstream: ["电池"]
+
+负极材料:
+  upstream: ["石墨", "化工原料"]
+  downstream: ["电池"]
+
+隔膜:
+  upstream: ["化工原料"]
+  downstream: ["电池"]
+
+电解液:
+  upstream: ["化工原料"]
+  downstream: ["电池"]
+
+电池:
+  upstream: ["锂矿", "正极材料", "负极材料", "隔膜", "电解液"]
+  downstream: ["新能源汽车", "储能"]
+
+新能源汽车:
+  upstream: ["电池", "汽车零部件", "芯片设计"]
+  downstream: ["充电桩", "汽车电子"]
+
+汽车零部件:
+  downstream: ["新能源汽车", "传统汽车"]
+
+充电桩:
+  upstream: ["新能源汽车", "电网设备"]
+  related: ["储能"]
+
+光伏硅料:
+  aliases: ["硅料"]
+  downstream: ["光伏电池片", "光伏组件"]
+
+光伏电池片:
+  upstream: ["光伏硅料"]
+  downstream: ["光伏组件"]
+
+光伏组件:
+  upstream: ["光伏硅料", "光伏电池片"]
+  downstream: ["储能", "电站运营"]
+
+储能:
+  upstream: ["电池", "光伏组件"]
+  downstream: ["电网设备"]
+
+风电整机:
+  upstream: ["风电零部件"]
+  downstream: ["电网设备"]
+
+风电零部件:
+  downstream: ["风电整机"]
+
+半导体设备:
+  downstream: ["晶圆制造", "芯片设计"]
+
+EDA:
+  aliases: ["电子设计自动化"]
+  downstream: ["芯片设计"]
+
+芯片设计:
+  upstream: ["半导体设备", "EDA"]
+  downstream: ["消费电子", "汽车电子", "AI算力"]
+
+晶圆制造:
+  upstream: ["半导体设备"]
+  downstream: ["封装测试", "芯片设计"]
+
+封装测试:
+  upstream: ["晶圆制造"]
+  downstream: ["消费电子", "汽车电子"]
+
+消费电子:
+  upstream: ["芯片设计", "封装测试"]
+  related: ["AI算力"]
+
+汽车电子:
+  upstream: ["芯片设计", "封装测试"]
+  downstream: ["新能源汽车"]
+
+AI算力:
+  upstream: ["芯片设计", "服务器"]
+  downstream: ["数据中心", "软件服务"]
+
+服务器:
+  upstream: ["芯片设计"]
+  downstream: ["AI算力", "数据中心"]
+
+数据中心:
+  upstream: ["服务器", "AI算力"]
+  downstream: ["软件服务"]
+
+软件服务:
+  upstream: ["AI算力", "数据中心"]
+  related: ["工业互联网"]
+
+工业互联网:
+  upstream: ["软件服务"]
+  downstream: ["机器人"]
+
+机器人:
+  upstream: ["工业互联网", "芯片设计"]
+
+房地产:
+  downstream: ["建材", "家电", "装修"]
+  related: ["银行"]
+
+建材:
+  upstream: ["房地产"]
+
+家电:
+  upstream: ["房地产", "芯片设计"]
+
+装修:
+  upstream: ["房地产", "建材"]
+
+白酒:
+  upstream: ["粮食", "包装"]
+  related: ["消费"]
+
+粮食:
+  downstream: ["白酒", "食品饮料"]
+
+包装:
+  downstream: ["白酒", "食品饮料"]
+
+银行:
+  related: ["保险", "券商", "房地产"]
+
+保险:
+  related: ["银行", "券商"]
+
+券商:
+  related: ["银行", "保险"]
