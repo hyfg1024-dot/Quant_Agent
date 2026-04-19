@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import unicodedata
 from datetime import datetime
@@ -8,10 +9,13 @@ from typing import Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 import requests
-try:
-    import streamlit as st
-except Exception:  # pragma: no cover
+if str(os.getenv("DISABLE_STREAMLIT_RUNTIME_CACHE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
     st = None  # type: ignore[assignment]
+else:
+    try:
+        import streamlit as st
+    except Exception:  # pragma: no cover
+        st = None  # type: ignore[assignment]
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 

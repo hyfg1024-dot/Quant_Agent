@@ -21,10 +21,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from shared.data_provider import AkshareDataProvider, FallbackDataProvider, QMTDataProvider
 
-try:
-    import streamlit as st
-except Exception:  # pragma: no cover - 非 Streamlit 环境兜底
+if str(os.getenv("DISABLE_STREAMLIT_RUNTIME_CACHE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
     st = None  # type: ignore[assignment]
+else:
+    try:
+        import streamlit as st
+    except Exception:  # pragma: no cover - 非 Streamlit 环境兜底
+        st = None  # type: ignore[assignment]
 
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={exchange}{symbol}"
 TENCENT_MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={exchange}{symbol}"

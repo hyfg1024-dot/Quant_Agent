@@ -37,6 +37,12 @@ rules:
     rsi_oversold: 20
     macd_flip_check: true
 
+  capital_flow:
+    enabled: true
+    northbound_min_days: 3
+    block_trade_premium_min: 0
+    composite_score_alert: 70
+
 push:
   channel: "telegram"  # telegram | serverchan | pushplus
   serverchan:
